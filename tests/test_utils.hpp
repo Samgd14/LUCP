@@ -44,6 +44,31 @@ public:
         return len;
     }
 
+    struct IncomingPacket {
+        std::vector<uint8_t> data;
+        uint32_t ip;
+        uint16_t port;
+    };
+    std::vector<IncomingPacket> incoming_packets;
+
+    void queue_packet(const uint8_t* buf, uint16_t len, uint32_t ip, uint16_t port) {
+        incoming_packets.push_back({std::vector<uint8_t>(buf, buf + len), ip, port});
+    }
+
+    int receive(uint8_t* buf, uint16_t max_len, uint32_t& src_ip, uint16_t& src_port) override {
+        if (incoming_packets.empty()) return 0;
+        auto packet = incoming_packets.front();
+        incoming_packets.erase(incoming_packets.begin());
+        
+        uint16_t to_copy = static_cast<uint16_t>(packet.data.size());
+        if (to_copy > max_len) to_copy = max_len;
+        
+        std::memcpy(buf, packet.data.data(), to_copy);
+        src_ip = packet.ip;
+        src_port = packet.port;
+        return to_copy;
+    }
+
     uint32_t now_ms() override {
         return m_time;
     }

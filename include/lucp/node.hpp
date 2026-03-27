@@ -328,6 +328,25 @@ public:
   }
 
   /**
+   * @brief Polls the transport for all available incoming packets and processes
+   * them. This method uses a stack buffer of size `HEADER_SIZE +
+   * MaxPayloadSize`.
+   * Should be called either in a main loop or via an interrupt/timer.
+   */
+  void process_incoming() {
+    uint8_t buffer[HEADER_SIZE + MaxPayloadSize];
+    uint32_t src_ip;
+    uint16_t src_port;
+
+    while (true) {
+      int len = m_transport.receive(buffer, sizeof(buffer), src_ip, src_port);
+      if (len <= 0)
+        break;
+      process_packet(buffer, static_cast<uint16_t>(len), src_ip, src_port);
+    }
+  }
+
+  /**
    * @brief Node heartbeat tick. Continually clears ACKs and pending loops.
    */
   void tick() {

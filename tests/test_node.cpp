@@ -10,6 +10,28 @@ public:
         return len;
     }
 
+    struct IncomingPacket {
+        std::vector<uint8_t> data;
+        uint32_t ip;
+        uint16_t port;
+    };
+    std::vector<IncomingPacket> m_incoming;
+
+    void queue_packet(const uint8_t* buf, uint16_t len, uint32_t ip, uint16_t port) {
+        m_incoming.push_back({std::vector<uint8_t>(buf, buf + len), ip, port});
+    }
+
+    int receive(uint8_t* buf, uint16_t max_len, uint32_t& src_ip, uint16_t& src_port) override {
+        if (m_incoming.empty()) return 0;
+        auto packet = m_incoming.front();
+        m_incoming.erase(m_incoming.begin());
+        uint16_t to_copy = (packet.data.size() > max_len) ? max_len : (uint16_t)packet.data.size();
+        std::memcpy(buf, packet.data.data(), to_copy);
+        src_ip = packet.ip;
+        src_port = packet.port;
+        return to_copy;
+    }
+
     uint32_t now_ms() override {
         return m_time;
     }
@@ -112,7 +134,14 @@ int main() {
     // Handled natively by the registered C++ object!
     node.process_packet(rx_packet, lucp::HEADER_SIZE + sizeof(MotorPayload), 0xC0A8010A, 9000);
 
-    std::cout << "\n4. Ticking to trigger Echo Queue drain\n";
+    std::cout << "\n4. Verifying process_incoming() helper\n";
+    transport.queue_packet(rx_packet, lucp::HEADER_SIZE + sizeof(MotorPayload), 0xC0A8010A, 9001);
+    transport.queue_packet(rx_packet, lucp::HEADER_SIZE + sizeof(MotorPayload), 0xC0A8010B, 9002);
+    
+    // This should process both queued packets
+    node.process_incoming();
+
+    std::cout << "\n5. Ticking to trigger Echo Queue drain\n";
     node.tick();
 
     std::cout << "\nTest Complete.\n";
