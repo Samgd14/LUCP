@@ -1,4 +1,6 @@
-# LUCP C++ Reference Implementation v0.2
+**NOTE** : This project is in active development. Breaking changes may be introduced at any time.
+
+# LUCP C++ Reference Implementation
 
 Lightweight UDP Command Protocol (LUCP) is a binary UDP protocol designed for low-latency, near-real-time command and telemetry exchange between hosts and resource-constrained embedded nodes.
 
