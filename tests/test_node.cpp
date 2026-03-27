@@ -1,52 +1,11 @@
+// test_node.cpp
+// Integration test / manual verification of the full Node send/receive/retry flow.
+// This file uses process_all() / receive_incoming() / ack_tick() (current API).
+
 #include "../include/lucp/node.hpp"
+#include "test_utils.hpp"
+#include <cstring>
 #include <iostream>
-#include <vector>
-
-// Mock Transport for testing
-class MockTransport : public lucp::ITransport {
-public:
-    int send(const uint8_t* buf, uint16_t len, uint32_t ip, uint16_t port) override {
-        std::cout << "MockTransport: Sending " << len << " bytes to " << ip << ":" << port << "\n";
-        return len;
-    }
-
-    struct IncomingPacket {
-        std::vector<uint8_t> data;
-        uint32_t ip;
-        uint16_t port;
-    };
-    std::vector<IncomingPacket> m_incoming;
-
-    void queue_packet(const uint8_t* buf, uint16_t len, uint32_t ip, uint16_t port) {
-        m_incoming.push_back({std::vector<uint8_t>(buf, buf + len), ip, port});
-    }
-
-    int receive(uint8_t* buf, uint16_t max_len, uint32_t& src_ip, uint16_t& src_port) override {
-        if (m_incoming.empty()) return 0;
-        auto packet = m_incoming.front();
-        m_incoming.erase(m_incoming.begin());
-        uint16_t to_copy = (packet.data.size() > max_len) ? max_len : (uint16_t)packet.data.size();
-        std::memcpy(buf, packet.data.data(), to_copy);
-        src_ip = packet.ip;
-        src_port = packet.port;
-        return to_copy;
-    }
-
-    uint32_t now_ms() override {
-        return m_time;
-    }
-
-    void log_unknown(uint8_t msg_id, uint32_t /*src_ip*/, uint16_t /*src_port*/) override {
-        std::cout << "MockTransport: Log Unknown msg_id=" << (int)msg_id << "\n";
-    }
-
-    void log_rejected(uint8_t msg_id, uint16_t received, uint16_t expected) override {
-        std::cout << "MockTransport: Log Rejected msg_id=" << (int)msg_id 
-                  << " (got " << received << ", expected " << expected << ")\n";
-    }
-
-    uint32_t m_time = 0;
-};
 
 // -------------------------------------------------------------
 // A Shared Message Definition (could live in shared_messages.hpp)
@@ -120,7 +79,7 @@ int main() {
     std::cout << "\n2. Ticking time by 400ms (should trigger 3 retries, then a failure callback)\n";
     for (int i = 0; i < 4; ++i) {
         transport.m_time += 150;
-        node.tick();
+        node.ack_tick();
     }
 
     std::cout << "\n3. Simulating receiving a packet back\n";
@@ -130,19 +89,19 @@ int main() {
     rx_packet[2] = 1; // msg_id
     rx_packet[3] = 42; // seq_id
     std::memcpy(&rx_packet[lucp::HEADER_SIZE], &tx_cmd, sizeof(MotorPayload));
-    
+
     // Handled natively by the registered C++ object!
     node.process_packet(rx_packet, lucp::HEADER_SIZE + sizeof(MotorPayload), 0xC0A8010A, 9000);
 
-    std::cout << "\n4. Verifying process_incoming() helper\n";
+    std::cout << "\n4. Verifying receive_incoming() helper\n";
     transport.queue_packet(rx_packet, lucp::HEADER_SIZE + sizeof(MotorPayload), 0xC0A8010A, 9001);
     transport.queue_packet(rx_packet, lucp::HEADER_SIZE + sizeof(MotorPayload), 0xC0A8010B, 9002);
-    
-    // This should process both queued packets
-    node.process_incoming();
 
-    std::cout << "\n5. Ticking to trigger Echo Queue drain\n";
-    node.tick();
+    // This should process both queued packets
+    node.receive_incoming();
+
+    std::cout << "\n5. Flushing echo queue\n";
+    node.flush_echo_queue();
 
     std::cout << "\nTest Complete.\n";
     return 0;

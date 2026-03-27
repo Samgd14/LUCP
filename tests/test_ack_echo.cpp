@@ -39,7 +39,7 @@ void test_ack_workflow() {
 
     // time passes, retry fires
     trans.m_time += 150;
-    node.tick();
+    node.ack_tick();
 
     ASSERT_EQ(trans.sent_packets.size(), 2); // Retried once!
 
@@ -56,7 +56,7 @@ void test_ack_workflow() {
     // tick again -> no more retries
     trans.m_time += 150;
     trans.m_time += 150;
-    node.tick();
+    node.ack_tick();
 
     ASSERT_EQ(msg.fail_count, 0); // Didn't fail!
     ASSERT_EQ(trans.sent_packets.size(), 2); // No more retries sent!
@@ -76,19 +76,19 @@ void test_ack_exhaustion() {
 
     // T1: 1st Retry
     trans.m_time += 150;
-    node.tick();
+    node.ack_tick();
     ASSERT_EQ(trans.sent_packets.size(), 2);
     ASSERT_EQ(msg.fail_count, 0);
 
     // T2: 2nd Retry
     trans.m_time += 150;
-    node.tick();
+    node.ack_tick();
     ASSERT_EQ(trans.sent_packets.size(), 3);
     ASSERT_EQ(msg.fail_count, 0);
 
     // T3: Exhausted
     trans.m_time += 150;
-    node.tick();
+    node.ack_tick();
     ASSERT_EQ(msg.fail_count, 1);
     ASSERT_EQ(trans.sent_packets.size(), 3); // No more TX
 }
@@ -110,10 +110,10 @@ void test_echo_response() {
     node.process_packet(rx, sizeof(rx), 0xC0A80201, 1000);
     
     ASSERT_EQ(msg.handled_count, 1);
-    ASSERT_EQ(trans.sent_packets.size(), 0); // Before tick, no echo sent!
+    ASSERT_EQ(trans.sent_packets.size(), 0); // Before flush, no echo sent!
 
-    // Tick drains echo queue
-    node.tick();
+    // flush_echo_queue dispatches the queued echo ACK
+    node.flush_echo_queue();
     ASSERT_EQ(trans.sent_packets.size(), 1);
     ASSERT_EQ(trans.sent_packets[0].data.size(), HEADER_SIZE); // Echo is header-only!
     ASSERT_EQ(trans.sent_packets[0].data[3], 42); // Sequence mirrored

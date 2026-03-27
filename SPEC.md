@@ -170,7 +170,7 @@ For inbound data packets of ack-required messages:
 1. Payload is validated.
 2. `handle()` is called.
 3. If `handle()` does not return `ERR_NOT_IMPLEMENTED`, the original 4-byte header is queued for echo.
-4. Echo headers are sent during `tick()`.
+4. Echo headers are dispatched when `flush_echo_queue()` (or `process_all()`) is called.
 
 If the echo queue is full, the packet is dropped before `handle()` is called.
 
@@ -199,8 +199,14 @@ Size mismatch cases call `ITransport::log_rejected(...)`.
 Applications provide platform networking and time through `ITransport`:
 
 ```cpp
-virtual int send(const uint8_t* buf, uint16_t len, uint32_t ip, uint16_t port) = 0;
+virtual int      send(const uint8_t* buf, uint16_t len, uint32_t ip, uint16_t port) = 0;
 virtual uint32_t now_ms() = 0;
+```
+
+Optional polling-mode receive hook (default returns 0; interrupt-driven transports may skip this):
+
+```cpp
+virtual int receive(uint8_t* buf, uint16_t max_len, uint32_t& src_ip, uint16_t& src_port);
 ```
 
 Optional diagnostics hooks:
@@ -220,10 +226,11 @@ The protocol core does not enforce byte order conversion of IP values; applicati
 ### 9.1 `Node` Template
 
 ```cpp
-template <size_t MsgCount = 256,
+template <size_t MsgCount      = 256,
           size_t EchoQueueDepth = 16,
           size_t MaxPendingAcks = 4,
-          size_t MaxPayloadSize = 256>
+          size_t MaxPayloadSize = 256,
+          size_t MaxRecvBurst   = 64>
 class Node;
 ```
 
@@ -231,6 +238,7 @@ class Node;
 - `EchoQueueDepth`: maximum queued outbound ACK echoes.
 - `MaxPendingAcks`: maximum concurrent reliable transmissions awaiting ACK.
 - `MaxPayloadSize`: maximum payload size accepted and transmitted by this node.
+- `MaxRecvBurst`: maximum packets drained per `receive_incoming()` call (prevents starvation).
 
 ### 9.2 Registration and Send APIs
 
@@ -252,11 +260,18 @@ void process_packet(const uint8_t* packet,
                     uint16_t size,
                     uint32_t source_ip,
                     uint16_t source_port);
-void tick();
+void receive_incoming();    // Drains transport RX buffer (polling mode)
+void ack_tick();            // Drives ACK retry and exhaustion callbacks
+void flush_echo_queue();    // Dispatches queued outbound echo ACKs
+void process_all();         // Convenience: receive_incoming + ack_tick + flush_echo_queue
 void reset();
 ```
 
-`tick()` must be called regularly to flush echo ACKs and perform retry scheduling.
+`receive_incoming()` polls `ITransport::receive()`. For interrupt/callback-driven transports,
+call `process_packet()` directly and skip `receive_incoming()`.
+
+`ack_tick()` and `flush_echo_queue()` must each be called regularly. Use `process_all()` for
+simple main-loop polling where all three share the same cadence.
 
 ---
 
@@ -278,7 +293,12 @@ The LUCP header fields are single-byte values and are byte-order agnostic. Paylo
 
 ### 10.4 Scheduling
 
-For reliable messaging and ACK echo behavior to work as intended, call `tick()` at a predictable cadence in your main loop or scheduler.
+For reliable messaging and ACK echo behavior to work as intended:
+
+- **`receive_incoming()`** should be called as fast as possible in a polling main loop, or driven by a receive-ready interrupt. Not needed for interrupt/callback-driven transports that call `process_packet()` directly.
+- **`ack_tick()`** should be called at a predictable cadence (e.g., every 10 ms) so retry delays are accurate.
+- **`flush_echo_queue()`** should be called regularly to dispatch pending echo ACKs with low latency.
+- **`process_all()`** calls all three in the correct order and is sufficient for simple single-threaded main loops.
 
 ---
 

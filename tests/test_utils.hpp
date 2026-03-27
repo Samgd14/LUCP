@@ -1,7 +1,6 @@
 #pragma once
 
 #include <iostream>
-#include <string>
 
 #define ASSERT_TRUE(condition) \
     do { \
@@ -59,14 +58,19 @@ public:
         if (incoming_packets.empty()) return 0;
         auto packet = incoming_packets.front();
         incoming_packets.erase(incoming_packets.begin());
-        
-        uint16_t to_copy = static_cast<uint16_t>(packet.data.size());
-        if (to_copy > max_len) to_copy = max_len;
-        
-        std::memcpy(buf, packet.data.data(), to_copy);
+
+        // Fail loudly if a queued test packet exceeds the node's buffer.
+        // This catches misconfigured tests rather than silently truncating data.
+        if (packet.data.size() > max_len) {
+            std::cerr << "MockTransport::receive: packet size " << packet.data.size()
+                      << " exceeds buffer size " << max_len << "\n";
+            return -1;
+        }
+
+        std::memcpy(buf, packet.data.data(), packet.data.size());
         src_ip = packet.ip;
         src_port = packet.port;
-        return to_copy;
+        return static_cast<int>(packet.data.size());
     }
 
     uint32_t now_ms() override {

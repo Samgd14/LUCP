@@ -156,7 +156,8 @@ private:
  * Fully templated to ensure zero dynamic allocation.
  */
 template <size_t MsgCount = 256, size_t EchoQueueDepth = 16,
-          size_t MaxPendingAcks = 4, size_t MaxPayloadSize = 256>
+          size_t MaxPendingAcks = 4, size_t MaxPayloadSize = 256,
+          size_t MaxRecvBurst = 64>
 class Node : public INode {
 public:
   explicit Node(ITransport &transport) : m_transport(transport) { reset(); }
@@ -330,15 +331,23 @@ public:
   /**
    * @brief Polls the transport for all available incoming packets and processes
    * them. This method uses a stack buffer of size `HEADER_SIZE +
-   * MaxPayloadSize`.
-   * Should be called either in a main loop or via an interrupt/timer.
+   * MaxPayloadSize` bytes; ensure `MaxPayloadSize` is bounded appropriately for
+   * embedded targets.
+   *
+   * Drains at most `MaxRecvBurst` packets per call to prevent starvation in a
+   * main loop if the transport continuously reports data. Enqueues outgoing ACK
+   * echoes but does not flush them — call `flush_echo_queue()` or
+   * `process_all()` to dispatch them.
+   *
+   * The transport's `receive()` implementation MUST populate `src_ip` and
+   * `src_port` whenever it returns a positive byte count.
    */
-  void process_incoming() {
+  void receive_incoming() {
     uint8_t buffer[HEADER_SIZE + MaxPayloadSize];
-    uint32_t src_ip;
-    uint16_t src_port;
+    uint32_t src_ip = 0;
+    uint16_t src_port = 0;
 
-    while (true) {
+    for (size_t i = 0; i < MaxRecvBurst; ++i) {
       int len = m_transport.receive(buffer, sizeof(buffer), src_ip, src_port);
       if (len <= 0)
         break;
@@ -347,12 +356,37 @@ public:
   }
 
   /**
-   * @brief Node heartbeat tick. Continually clears ACKs and pending loops.
+   * @brief Processes pending ACK retries and timeout failures.
+   * Iterates all tracked outbound messages and retransmits those whose retry
+   * delay has elapsed. Calls `IMessage::on_fail()` when retries are exhausted.
+   * Should be called on a regular timer (e.g. every 10 ms) or in a main loop.
    */
-  void tick() {
+  void ack_tick() {
     uint32_t now_ms = m_transport.now_ms();
-    m_echo_queue.flush(m_transport);
     m_ack_manager.tick(m_transport, now_ms, m_registry);
+  }
+
+  /**
+   * @brief Flushes all queued outgoing ACK echo packets via the transport.
+   * Echoes are enqueued by `receive_incoming()` when a reliable message is
+   * received. This must be called to actually dispatch them. May be called
+   * independently or via `process_all()`.
+   */
+  void flush_echo_queue() { m_echo_queue.flush(m_transport); }
+
+  /**
+   * @brief Convenience method: polls for incoming packets, retries pending
+   * ACKs, and flushes outgoing echo queue in one call. Suitable for simple
+   * main-loop polling where all three operations share the same cadence.
+   *
+   * For interrupt-driven or RTOS designs, prefer calling `receive_incoming()`,
+   * `ack_tick()`, and `flush_echo_queue()` independently at their respective
+   * rates.
+   */
+  void process_all() {
+    receive_incoming();
+    ack_tick();
+    flush_echo_queue();
   }
 
 private:

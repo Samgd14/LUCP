@@ -73,7 +73,7 @@ public:
    */
   int send_raw(const uint8_t *payload, uint32_t dest_ip, uint16_t dest_port) {
     if (!m_node)
-      return -1; // Not registered to any node!
+      return ERR_BAD_ARG; // Not registered to any node
     return m_node->send_raw(id(), payload, size(), dest_ip, dest_port);
   }
 };
