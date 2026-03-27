@@ -10,7 +10,6 @@ This repository contains the C++ implementation of the protocol.
 
 For a comprehensive explanation of the library's architecture and usage, please see:
 
-- [IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md): Guide to creating your `ITransport` PAL, defining `TypedMessage` classes, and bootstrapping the `Node`.
 - [SPEC.md](SPEC.md): Full breakdown of the LUCP binary wire format, message registry semantics, and acknowledgment mechanism.
 
 ## Workspace Structure
