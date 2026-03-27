@@ -1,4 +1,4 @@
-# Lightweight UDP Control Protocol (LUCP) — Specification v0.2
+# Lightweight UDP Control Protocol (LUCP) - Specification v0.2
 
 ---
 
@@ -8,69 +8,55 @@
 2. [Design Principles](#2-design-principles)
 3. [Network Topology](#3-network-topology)
 4. [Wire Format](#4-wire-format)
-5. [Message Schema System](#5-message-schema-system)
+5. [Message Model](#5-message-model)
 6. [Acknowledgment Mechanism](#6-acknowledgment-mechanism)
-7. [Dispatch & Node Framework](#7-dispatch--node-framework)
-8. [Transport Abstraction (ITransport)](#8-transport-abstraction-itransport)
-9. [Shared C++ Core — Interface Reference](#9-shared-c-core--interface-reference)
-10. [Performance Targets](#10-performance-targets)
-11. [Implementation Notes](#11-implementation-notes)
+7. [Node Dispatch Behavior](#7-node-dispatch-behavior)
+8. [Transport Abstraction (`ITransport`)](#8-transport-abstraction-itransport)
+9. [C++ Interface Reference](#9-c-interface-reference)
+10. [Implementation Notes](#10-implementation-notes)
 
 ---
 
 ## 1. Overview
 
-LUCP is a binary UDP protocol designed for low-latency, near-real-time command and telemetry exchange between a host server (ARM/x86) and a fleet of resource-constrained embedded nodes (RP2040, ESP32, STM32, etc). It prioritizes minimal wire overhead, near-deterministic processing, and a heavily templated C++ implementation that compiles without modification on both sides.
+LUCP is a compact binary UDP protocol for low-latency command and telemetry traffic between a host and embedded nodes.
 
-This document defines version 0.2 of the wire format, the message registry object model, the acknowledgment mechanism, and the transport abstraction layer required to route communications contextually.
+This repository provides a shared C++ core that runs on both sides. The protocol layer is header-only, uses fixed compile-time bounds, and avoids dynamic allocation in core data paths.
+
+Version `0.2` in this document matches the implementation under `include/lucp/`.
 
 ---
 
 ## 2. Design Principles
 
 | Principle | Rationale |
-|-----------|-----------|
-| **Minimal header overhead** | Every byte matters on embedded MCUs |
-| **Fixed-size messages** | Eliminates length parsing; enables O(1) validation |
-| **Shared C++ core** | Single template codebase for server/node; totally object-oriented |
-| **Echo-based ACK** | No separate validation message; receiver echoes the 4-byte header |
-| **Per-message sequence tracking** | Avoids false ACK matches across concurrent streams |
-| **Zero dynamic memory allocation** | Everything is rigidly bounded by compile-time templates on the node |
-| **Little-endian wire format** | Consistent with modern target architecture alignments |
+|-----------|----------------|
+| Minimal header overhead | Keep packet overhead low on constrained systems |
+| Fixed payload size per message | Fast validation and simple parsing |
+| Shared C++ message definitions | Keep host and node message contracts identical |
+| Echo-based ACK | Reuse the header as ACK instead of defining a separate ACK packet type |
+| Per-message sequence counters | Track in-flight reliable sends per message ID |
+| Statically bound | Core queues and pending ACK state are fixed at compile time |
 
 ---
 
 ## 3. Network Topology
 
-```
-[ARM/x86 Server] <---> [Standard Ethernet Switch] <---> [MCU Node A]
-       |                          |                  -> [MCU Node B]
-  UDP Port 9000             Standard Switch          -> [MCU Node N]
-  Static/DHCP IP           (No TSN required)            DHCP Assigned
-```
+Typical deployment is UDP over IPv4 on standard Ethernet.
 
-- **Transport:** UDP/IPv4 over standard Ethernet
-- **Default port:** 9000 (configurable)
-- **Node addressing:** DHCP-assigned IPv4 by default; for permanent deployments use static IPs or DHCP reservations (see §3.1)
-- **Multi-application scaling:** If an application requires more than 256 distinct message concepts, instantiate another UDP socket parsing via an entirely separated Node context on another port.
+- Transport: UDP/IPv4
+- Default port: `9000` (application configurable)
+- Addressing: static IPs, DHCP reservations, or DHCP in development
 
-### 3.1 Address Assignment Strategy
-
-Address stability is operationally important because the server tracks node endpoints by `(ip, port)`.
-
-- **Development / lab:** Plain DHCP is acceptable.
-- **Permanent deployments (recommended):**
-    - Use **DHCP reservations** (preferred) keyed by node MAC address, or
-    - Use **static IP** configuration on each node.
-- **Server requirement:** Maintain persistent node identity mapping (`node_id -> ip, port, mac`) and log endpoint changes.
+LUCP does not mandate a single global discovery or identity system. Endpoint mapping is an application concern.
 
 ---
 
 ## 4. Wire Format
 
-### 4.1 Header Structure
+### 4.1 Header Layout
 
-The header is exactly **4 bytes**, followed immediately by the message payload.
+Each packet starts with a 4-byte header, which is then followed by the payload:
 
 ```
  0               1               2               3
@@ -84,295 +70,216 @@ The header is exactly **4 bytes**, followed immediately by the message payload.
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
-| Offset | Size | Field | Value / Constraints |
-|--------|------|-------|---------------------|
-| 0-1 | 2 bytes | `magic` | Fixed: `0xFA` and `0x51` — protocol identifier and noise filter |
-| 2 | 1 byte | `msg_id` | Message type identifier, `0x00–0xFF` |
-| 3 | 1 byte | `seq_id` | Rolling sequence counter, wraps at 256 |
-| 4-N | N bytes | `payload` | Fixed-length payload as encoded structurally |
+Constants in code:
+
+- `MAGIC_0 = 0xFA`
+- `MAGIC_1 = 0x51`
+- `HEADER_SIZE = 4`
 
 ### 4.2 Field Details
 
-**`magic` (2 bytes)**
-The two-byte magic sequence `0xFA` followed by `0x51` serves as a fast noise filter. A packet is discarded immediately if either byte does not match. Not guaranteed integrity; UDP checksum validates integrity.
+- `magic`: fast protocol filter; packets with wrong magic bytes are dropped.
+- `msg_id`: message identifier (`uint8_t`). Value `0` is invalid in current implementation.
+- `seq_id`: rolling sequence byte assigned by sender per `msg_id`.
+- `payload`: exactly `IMessage::size()` bytes for that `msg_id`.
 
-**`msg_id` (1 byte)**
-Identifies the message type up to 255 elements.
+### 4.3 Packet Types
 
-**`seq_id` (1 byte)**
-A rolling counter incremented by the sender on each transmission of a given `msg_id`. The counter is maintained **per message type**, not globally. Wraps from `0xFF` to `0x00` without error.
+- Data packet: header + payload.
+- ACK packet: header only (`size == HEADER_SIZE`).
 
-**`payload` (variable, fixed per type)**
-Raw binary payload. All multi-byte fields within the payload are encoded in **little-endian** byte order. The dispatch layer enforces size prior to passing data up to appropriate handler.
-
-### 4.3 Total Packet Size
-
-```
-Total packet size = 4 (header) + payload_size (from registry class structure)
-```
-
-Practical upper boundaries:
-- **Preferred payload size:** `<= 32 bytes`
-- **Default upper bound:** `<= 256 bytes`
-- **No-fragmentation MTU:** `<= 1468 bytes` payload
+### 4.4 Size Constraints
+The maximum payload size is defined by the `Node` template parameter `MaxPayloadSize`. The total packet size must fit within typical UDP limits (e.g., 512 bytes or less) to avoid fragmentation. It is recommended to minimize payload sizes for better performance and reliability on constrained networks and nodes.
 
 ---
 
-## 5. Message Schema System
+## 5. Message Model
 
-### 5.1 Object Model
+LUCP does not define built-in application message schemas. Applications provide message classes derived from `IMessage`.
 
-The message registry is constructed from class definitions mapped dynamically at runtime via `lucp::Node::register_message`.
-Because this runs directly on the Node without `new` or `malloc`, the instantiations define all properties naturally via `virtual` properties.
+Required message metadata (should be implemented project-wide):
 
 ```cpp
-virtual uint8_t  id() const = 0;              // Identification byte
-virtual uint16_t size() const = 0;            // Static payload sizing limits
-virtual bool     ack_required() const = 0;    // Whether this requires Echoing
-virtual uint8_t  max_retries() const;         // Try allowance bounds
-virtual uint16_t retry_delay_ms() const;      // Try timer intervals
+virtual uint8_t  id() const = 0;
+virtual uint16_t size() const = 0;
+virtual bool     ack_required() const = 0;
 ```
 
-Memory limits are configured strictly via the `Node` initialization. Attempting to override the Node's max allowed size caps will result in compilation errors. Stack usage is pre-allocated based on the maximum message size and the number of messages that can be queued.
+Optional reliability parameters (only relevant if `ack_required()` returns `true`):
 
-### 5.2 Assigned Message Types
+```cpp
+virtual uint8_t  max_retries() const { return 0; }
+virtual uint16_t retry_delay_ms() const { return 0; }
+```
 
-Message type IDs are assigned sequentially starting at `0x01`. ID `0x00` is reserved.
+Receive and failure hooks (should be implemented per-platform):
 
-Here is what an example message ID allocation table looks like:
-| ID | Name | Payload Size | ACK Required | Description |
-|----|------|-------------|--------------|-------------|
-| `0x00` | *(reserved)* | — | — | Invalid; discard on receipt |
-| `0x01` | `MOTOR_CMD` | 8 bytes | Yes | Torque/position setpoint |
-| `0x02` | `SENSOR_DATA` | 16 bytes | No | Processed telemetry (application metrics) |
-| `0x03` | `SYSTEM_STATUS` | 12 bytes | No | Health / generic data points |
-| `0x04-FF` | *(available)* | — | — | Other bindings |
+```cpp
+virtual int handle(const uint8_t* payload, uint16_t size);
+virtual int on_fail();
+virtual int send_raw(const uint8_t* payload, uint16_t size, uint32_t dest_ip, uint16_t dest_port);
+```
+
+Important implementation rules:
+
+- `id() == 0` is rejected at registration time.
+- `size() == 0` is rejected at registration time.
+- `size()` must be `<= MaxPayloadSize` of the `Node` template instance.
+- Messages are registered by ID into a fixed array (`Node::register_message`).
+
+The helper `TypedMessage<TPayload>` automatically implements `size()` as `sizeof(TPayload)` and provides a typed `send()` wrapper.
 
 ---
 
 ## 6. Acknowledgment Mechanism
 
-### 6.1 Echo-Based ACK Design
+### 6.1 Echo-based ACK
 
-When a message is transmitted with `ack_required` mapped internally as `true`, the receiver immediately responds by queuing a header-only packet to the sender, matching the incoming message's header.
+When a registered message has `ack_required()` return `true`, `Node::send_raw(...)`:
 
-Here is how the echo packet could be validated:
-```cpp
-echo.magic[0]   == 0xFA
-echo.magic[1]   == 0x51
-echo.msg_id     == original.msg_id
-echo.seq_id     == original.seq_id
-echo.size       == 4 (no payload)
-```
+1. Assigns and increments the sequence byte for that message ID.
+2. Builds and sends the packet.
+3. Stores a pending ACK record in a bounded internal table.
 
-### 6.2 Sequence Counter Behavior
+If the send call fails, the pending record for that packet is cleared.
 
-Counters are maintained per message type. Wraparounds natively increment safely (8-bit truncations) with expected recovery.
+### 6.2 ACK Matching
 
-> **Hard constraint (type bound):** `max_retries < 256`.
+An inbound header-only packet is treated as an ACK candidate.
 
-### 6.3 Sender Behavior
+It clears a pending record only when all fields match:
 
-1. Class `IMessage` encapsulates object sending. Node assigns Seq_ID natively.
-2. UDP Payload constructed natively.
-3. If ack_required: Add item to the ACK pending pool statically. Set timestamp ticks.
-4. Node::tick() will recursively fire retries or cleanup.
-5. In exhaustion timeout scenario, virtual on_fail() callback handles uncoupling safely.
+- `msg_id`
+- `seq_id`
+- source `ip`
+- source `port`
 
-### 6.4 Receiver Behavior
+ACKs for non-ack-required messages are rejected (`log_rejected`).
 
-1. Node processes inbound packets from `process_packet`.
-2. Native checks discard packets without registered components gracefully.
-3. Payload validations execute ensuring safe internal sizes mapping onto structures.
-4. Calls Native `msg->handle()`. 
-5. Inbound sequences triggering ACKs are buffered to bounded static arrays to push later safely via Node `tick()`.
+### 6.3 Retry and Exhaustion
 
----
+`Node::tick()` drives retries using `ITransport::now_ms()` and each message's `retry_delay_ms()`.
 
-## 7. Dispatch & Node Framework
+- While retries remain: packet is resent and `retries_remaining` is decremented.
+- When retries are exhausted: pending record is removed and `on_fail()` is called.
 
-### 7.1 Dispatch Constants
+### 6.4 Echo ACK on Receive
 
-Core protocol constants are standardized strictly in `protocol.hpp`.
-Return values enforce structural errors implicitly via constants (e.g. `ERR_NOT_IMPLEMENTED`).
+For inbound data packets of ack-required messages:
 
-### 7.2 Instantiating the Node
+1. Payload is validated.
+2. `handle()` is called.
+3. If `handle()` does not return `ERR_NOT_IMPLEMENTED`, the original 4-byte header is queued for echo.
+4. Echo headers are sent during `tick()`.
 
-Node sizes bounds are totally enforced during instantiation.
-
-```cpp
-#include <lucp/node.hpp>
-
-// Template parameters for static bounds:
-// Node<MsgCount, EchoQueueDepth, MaxPendingAcks, MaxPayloadSize>
-lucp::Node<32, 16, 4, 128> my_node(my_sys_transport);
-```
-
-### 7.3 Message Subclassing
-
-The implementation shifts natively towards heavily typed `TypedMessage` implementations or bare `IMessage` definitions.
-Override `id()`, `ack_required()`, and other parameters.
-
-```cpp
-struct MyStruct { uint32_t x; float f; };
-
-class MyCommand : public lucp::TypedMessage<MyStruct> {
-public:
-    uint8_t id() const override { return 0xA1; }
-    bool ack_required() const override { return true; }
-
-    int handle(const uint8_t* payload, uint16_t size) override {
-        MyStruct received;
-        std::memcpy(&received, payload, sizeof(MyStruct));
-        // Action logic
-        return lucp::OK;
-    }
-
-    int on_fail() override {
-        // Retry limit exhausted
-        return lucp::OK;
-    }
-};
-```
-
-### 7.4 Registry Dispatching
-
-Registrations happen via object inheritance injection. Pass the message reference inside your setup:
-
-```cpp
-MyCommand my_cmd_msg;
-my_node.register_message(&my_cmd_msg);
-
-// Send explicitly matching defined payload sizes natively!
-MyStruct msg_payload = {10, 3.14f};
-my_cmd_msg.send(msg_payload, dest_ip, 9000);
-```
-
-### 7.5 Handler Budget Restraints
-Handlers execute precisely inline within `node.process_packet()`. Unregistered, oversized, or improperly sequenced payloads ignore handler propagation fully directly at the array boundary layer. No allocations trigger locally. The architecture remains absolutely clean.
+If the echo queue is full, the packet is dropped before `handle()` is called.
 
 ---
 
-## 8. Transport Abstraction (ITransport)
+## 7. Node Dispatch Behavior
 
-The hardware agnostic implementation isolates network communication purely across an implementation interface wrapper. C style `lucp_pal` files have been excised entirely. You must implement `ITransport`.
+`Node::process_packet(...)` behavior in the current implementation:
 
-### 8.1 Implementing The Interface
+1. Drop packet if null or shorter than header.
+2. Validate magic bytes.
+3. Validate `msg_id` (`1..MsgCount-1`) and lookup registered message.
+4. Reject registered messages whose declared `size()` is zero.
+5. If `size == HEADER_SIZE`, process as ACK path.
+6. Otherwise require payload size exactly equal to `IMessage::size()`.
+7. Call `handle(payload, payload_size)`.
+8. For ack-required messages, queue echo ACK (unless queue full).
 
-```cpp
-class MyTransport : public lucp::ITransport {
-public:
-    int send(const uint8_t* buf, uint16_t len, uint32_t ip, uint16_t port) override {
-        // e.g. Arduino EthernetUDP implementation...
-        Udp.beginPacket(IPAddress(ip), port);
-        Udp.write(buf, len);
-        return Udp.endPacket() ? len : lucp::ERR_PAL_SEND;
-    }
-
-    uint32_t now_ms() override {
-        return millis(); // Standard timing tick logic
-    }
-    
-    // Optional diagnostics
-    void log_unknown(uint8_t msg_id, uint32_t src_ip, uint16_t src_port) override {
-        Serial.printf("Unknown ID %02X\n", msg_id);
-    }
-};
-```
-
-### 8.2 Memory Constraints
-
-| Platform | Core RAM Budget | Dynamic Allocation |
-|----------|-----------------|--------------------|
-| Embedded Node (Low Config) | Bound by Node templates (< 1 KB) | `new`/`malloc` **Not utilized** |
-| Server Side OS | Heap Allocation Acceptable bounds | **Allowed internally across app** |
-
-All elements map inside bounds. Array arrays natively compile and occupy strictly the minimum footprints.
+Unknown or unregistered IDs call `ITransport::log_unknown(...)`.
+Size mismatch cases call `ITransport::log_rejected(...)`.
 
 ---
 
-## 9. Shared C++ Core — Interface Reference
+## 8. Transport Abstraction (`ITransport`)
 
-### 9.1 IMessage Core 
-
-Abstract components define structural metadata required mapping commands sequentially and robustly across dispatch layers:
+Applications provide platform networking and time through `ITransport`:
 
 ```cpp
-class IMessage {
-public:
-    virtual uint8_t  id() const = 0;
-    virtual uint16_t size() const = 0;
-    virtual bool     ack_required() const = 0;
-    
-    // Optional overrides mappings 
-    virtual uint8_t  max_retries() const { return 0; }
-    virtual uint16_t retry_delay_ms() const { return 0; }
-
-    // Execute logic handling callbacks mapped directly natively inside context.
-    virtual int handle(const uint8_t* payload, uint16_t size) { return lucp::ERR_NOT_IMPLEMENTED; }
-    virtual int on_fail() { return lucp::ERR_NOT_IMPLEMENTED; }
-    
-    // Abstracted helper explicitly enforcing context inheritance 
-    int send_raw(const uint8_t* payload, uint32_t dest_ip, uint16_t dest_port);
-};
+virtual int send(const uint8_t* buf, uint16_t len, uint32_t ip, uint16_t port) = 0;
+virtual uint32_t now_ms() = 0;
 ```
 
-### 9.2 Node Object Methods
-
-The Node handles structural mapping explicitly. 
-
-`process_packet()` accepts raw array buffering, matches exact length boundaries against ID tables natively spanning sizes correctly, then pushes payloads directly onto `msg->handle()`. 
-
-`tick()` cascades internal bounded timeout states, evaluates echo queuing array allocations iteratively clearing queues sequentially against specified configurations natively matching `ITransport->now_ms()`. 
-
-Calling `tick()` continuously propagates ACKs and pending responses effectively efficiently.
+Optional diagnostics hooks:
 
 ```cpp
-my_node.tick(); 
-my_node.process_packet(rxBuffer, rxSize, sourceIP, sourcePort);
+virtual void log_debug(const char* fmt, ...);
+virtual void log_unknown(uint8_t msg_id, uint32_t src_ip, uint16_t src_port);
+virtual void log_rejected(uint8_t msg_id, uint16_t received_size, uint16_t expected_size);
 ```
 
-### 9.3 Endianness Expectations
-
-All multi-byte fields logically map uniformly cross **little-endian** natively inline across structures. Ensure alignment specifications are robust when converting between architectural implementations directly manually structurally inline via struct overlays directly. Cortex-M0 targets prefer struct `memcpy()` usage mapping explicitly.
+The protocol core does not enforce byte order conversion of IP values; applications should keep sender/receiver conventions consistent.
 
 ---
 
-## 10. Performance Targets
+## 9. C++ Interface Reference
 
-### 10.1 Latency Budget (Target: < 10 ms application round-trip)
-
-| Component | Target | Measurement |
-|-----------|--------|-------------|
-| SPI transfer (MCU → W5500) | ≤ 20 µs | GPIO toggle around SPI write |
-| Network switch latency | ≤ 100 µs | Standard unmanaged switch |
-| Protocol Node processing | < 1 ms | Overhead measurements across node layer |
-
----
-
-## 11. Implementation Notes
-
-### 11.1 Packed Struct Alignment on Cortex-M0/M0+
-
-The RP2040 does not support unaligned accesses directly reliably mapping overlays structurally.
-Always utilize `memcpy` when injecting memory allocations reliably inherently locally inline identically mapping variables precisely statically inline:
+### 9.1 `Node` Template
 
 ```cpp
-// Correct mapping behavior
-lucp::Header hdr;
-std::memcpy(&hdr, packet, sizeof(hdr));
+template <size_t MsgCount = 256,
+          size_t EchoQueueDepth = 16,
+          size_t MaxPendingAcks = 4,
+          size_t MaxPayloadSize = 256>
+class Node;
 ```
 
-The Node intrinsically follows this process extracting sequence headers logically robustly.
+- `MsgCount`: size of message registry and sequence table.
+- `EchoQueueDepth`: maximum queued outbound ACK echoes.
+- `MaxPendingAcks`: maximum concurrent reliable transmissions awaiting ACK.
+- `MaxPayloadSize`: maximum payload size accepted and transmitted by this node.
 
-### 11.2 ISR Discipline
+### 9.2 Registration and Send APIs
 
-Protocol evaluations must not map natively structurally dynamically inside asynchronous interrupt allocations. Process inbound packets caching safely out-bound contexts reliably parsing memory safely inside `loop` or RTOS Thread queues effectively securely mapping states.
+```cpp
+int register_message(IMessage* msg);
+int send_raw(uint8_t msg_id,
+             const uint8_t* payload,
+             uint16_t payload_size,
+             uint32_t dest_ip,
+             uint16_t dest_port);
+```
 
-### 11.3 Multi-Port Capabilities
+`IMessage::send_raw(...)` forwards to the node instance set during registration.
 
-Spin up a new `lucp::Node` instance alongside an alternative `ITransport` UDP bound socket to securely map independent configurations safely scaling endpoints sequentially effectively mapping bounds directly.
+### 9.3 Runtime APIs
+
+```cpp
+void process_packet(const uint8_t* packet,
+                    uint16_t size,
+                    uint32_t source_ip,
+                    uint16_t source_port);
+void tick();
+void reset();
+```
+
+`tick()` must be called regularly to flush echo ACKs and perform retry scheduling.
 
 ---
 
-*End of specification — LUCP v0.2*
+## 10. Implementation Notes
+
+### 10.1 Memory Behavior
+
+Core containers are statically sized via template parameters.
+
+One notable stack allocation exists in `Node::send_raw(...)`, where a local packet buffer of `HEADER_SIZE + MaxPayloadSize` bytes is built before transport send. Select `MaxPayloadSize` with your platform stack budget in mind.
+
+### 10.2 Message IDs
+
+The library reserves only ID `0` as invalid. Other ID meanings are application-defined.
+
+### 10.3 Endianness
+
+The LUCP header fields are single-byte values and are byte-order agnostic. Payload endianness should be kept consistent across peers; implement shared message structs and serialization logic accordingly.
+
+### 10.4 Scheduling
+
+For reliable messaging and ACK echo behavior to work as intended, call `tick()` at a predictable cadence in your main loop or scheduler.
+
+---
+
+End of specification - LUCP v0.2
