@@ -5,398 +5,520 @@
 #include "transport.hpp"
 #include <cstring>
 
-namespace lucp {
+namespace lucp
+{
 
-namespace internal {
+  namespace internal
+  {
 
-/**
- * @brief Circular queue for buffering outgoing ACKs (Echoes).
- * Fully statically allocated, bounded by EchoQueueDepth.
- * Stores only the necessary 4-byte headers to echo back a receipt confirmation.
- */
-template <size_t EchoQueueDepth> class EchoQueue {
-public:
-  /**
-   * @brief Individual echo packet buffered for dispatch.
-   */
-  struct EchoRecord {
-    uint32_t dest_ip;
-    uint16_t dest_port;
-    uint8_t header[HEADER_SIZE];
-  };
+    /**
+     * @brief Circular queue for buffering outgoing ACKs (Echoes).
+     * Fully statically allocated, bounded by EchoQueueDepth.
+     * Stores only the necessary 4-byte headers to echo back a receipt confirmation.
+     */
+    template <size_t EchoQueueDepth>
+    class EchoQueue
 
-  void reset() {
-    m_head = 0;
-    m_tail = 0;
-    m_count = 0;
-  }
+    {
+    public:
+      /**
+       * @brief Individual echo packet buffered for dispatch.
+       */
+      struct EchoRecord
+      {
+        uint32_t dest_ip;
+        uint16_t dest_port;
+        uint8_t header[HEADER_SIZE];
+      };
 
-  bool enqueue(const uint8_t *header, uint32_t dest_ip, uint16_t dest_port) {
-    if (m_count >= EchoQueueDepth)
-      return false;
-    auto &echo = m_queue[m_tail];
-    echo.dest_ip = dest_ip;
-    echo.dest_port = dest_port;
-    std::memcpy(echo.header, header, HEADER_SIZE);
-    m_tail = (m_tail + 1) % EchoQueueDepth;
-    m_count++;
-    return true;
-  }
-
-  bool is_full() const { return m_count >= EchoQueueDepth; }
-
-  void flush(ITransport &transport) {
-    while (m_count > 0) {
-      const auto &echo = m_queue[m_head];
-      transport.send(echo.header, HEADER_SIZE, echo.dest_ip, echo.dest_port);
-      m_head = (m_head + 1) % EchoQueueDepth;
-      m_count--;
-    }
-  }
-
-private:
-  EchoRecord m_queue[EchoQueueDepth] = {};
-  size_t m_head = 0;
-  size_t m_tail = 0;
-  size_t m_count = 0;
-};
-
-/**
- * @brief Manager for pending acknowledgments and retry logic.
- * Keeps a statically bounded tracking array of all messages
- * waiting for an ACK. Flushes retries automatically on tick().
- */
-template <size_t MaxPendingAcks, size_t MaxPayloadSize> class AckManager {
-public:
-  /**
-   * @brief A tracked message that is waiting for an ACK.
-   */
-  struct PendingAck {
-    bool active;
-    uint8_t msg_id;
-    uint8_t seq_id;
-    uint32_t dest_ip;
-    uint16_t dest_port;
-    uint8_t retries_remaining;
-    uint16_t packet_len;
-    uint32_t last_tx_ms;
-    uint8_t packet[HEADER_SIZE + MaxPayloadSize];
-  };
-
-  void reset() {
-    for (size_t i = 0; i < MaxPendingAcks; ++i) {
-      m_pending[i].active = false;
-    }
-  }
-
-  int allocate() {
-    for (size_t i = 0; i < MaxPendingAcks; ++i) {
-      if (!m_pending[i].active)
-        return static_cast<int>(i);
-    }
-    return -1;
-  }
-
-  PendingAck *get(int index) {
-    if (index < 0 || index >= static_cast<int>(MaxPendingAcks))
-      return nullptr;
-    return &m_pending[index];
-  }
-
-  void clear(uint8_t msg_id, uint8_t seq_id, uint32_t dest_ip,
-             uint16_t dest_port) {
-    for (size_t i = 0; i < MaxPendingAcks; ++i) {
-      auto &pend = m_pending[i];
-      if (pend.active && pend.msg_id == msg_id && pend.seq_id == seq_id &&
-          pend.dest_ip == dest_ip && pend.dest_port == dest_port) {
-        pend.active = false;
-        break;
-      }
-    }
-  }
-
-  template <size_t MsgCount>
-  void tick(ITransport &transport, uint32_t now_ms,
-            IMessage *const (&registry)[MsgCount]) {
-    for (size_t i = 0; i < MaxPendingAcks; ++i) {
-      auto &pend = m_pending[i];
-      if (!pend.active)
-        continue;
-
-      IMessage *item = registry[pend.msg_id];
-      if (!item) {
-        pend.active = false;
-        continue;
+      /**
+       * @brief Clears all buffered echo records.
+       */
+      void reset()
+      {
+        m_head = 0;
+        m_tail = 0;
+        m_count = 0;
       }
 
-      // Handle unsigned 32-bit timestamp wraparound safely
-      if ((now_ms - pend.last_tx_ms) >= item->retry_delay_ms()) {
-        if (pend.retries_remaining > 0) {
-          pend.retries_remaining--;
-          pend.last_tx_ms = now_ms;
-          transport.send(pend.packet, pend.packet_len, pend.dest_ip,
-                         pend.dest_port);
-        } else {
-          // Exhausted all transmission attempts
-          pend.active = false;
-          item->on_fail();
+      /**
+       * @brief Enqueue an echo record for dispatch.
+       * @param packet The received packet to acknowledge.
+       * @param dest_ip The destination IP address.
+       * @param dest_port The destination port.
+       * @return True if the record was enqueued, false if the queue is full.
+       */
+      int enqueue(const uint8_t *packet, uint32_t dest_ip, uint16_t dest_port)
+      {
+        // Check if the queue is full before enqueuing
+        if (m_count >= EchoQueueDepth)
+          return ERR_QUEUE_FULL;
+
+        // Construct the echo header (magic bytes + msg_id + seq_id)
+        uint8_t header[HEADER_SIZE] = {MAGIC_0, MAGIC_1, packet[2], packet[3]};
+
+        // Store the echo record in the circular queue
+        auto &echo = m_queue[m_tail];
+        echo.dest_ip = dest_ip;
+        echo.dest_port = dest_port;
+        std::memcpy(echo.header, header, HEADER_SIZE);
+
+        // Advance tail and increment count
+        m_tail = (m_tail + 1) % EchoQueueDepth;
+        m_count++;
+        return true;
+      }
+
+      /**
+       * @brief Checks whether the queue can accept more echo records.
+       * @return True when the queue is full.
+       */
+      bool is_full() const { return m_count >= EchoQueueDepth; }
+
+      /**
+       * @brief Sends all queued echo records through the transport.
+       * @param transport Transport implementation used for packet transmission.
+       */
+      void flush(ITransport &transport)
+      {
+        while (m_count > 0)
+        {
+          const auto &echo = m_queue[m_head];
+          transport.send(echo.header, HEADER_SIZE, echo.dest_ip, echo.dest_port);
+          m_head = (m_head + 1) % EchoQueueDepth;
+          m_count--;
+        }
+      }
+
+    private:
+      EchoRecord m_queue[EchoQueueDepth] = {};
+      size_t m_head = 0;
+      size_t m_tail = 0;
+      size_t m_count = 0;
+    };
+
+    /**
+     * @brief Manager for pending acknowledgments and retry logic.
+     * Keeps a statically bounded tracking array of all messages
+     * waiting for an ACK. Flushes retries automatically on tick().
+     */
+    template <size_t MaxPendingAcks, size_t MaxPayloadSize>
+    class AckManager
+    {
+    public:
+      /**
+       * @brief A tracked message that is waiting for an ACK.
+       */
+      struct PendingAck
+      {
+        bool active;
+        uint8_t msg_id;
+        uint8_t seq_id;
+        uint32_t dest_ip;
+        uint16_t dest_port;
+        uint8_t retries_remaining;
+        uint16_t packet_len;
+        uint32_t last_tx_ms;
+        uint8_t packet[HEADER_SIZE + MaxPayloadSize];
+      };
+
+      /**
+       * @brief Clears all tracked pending acknowledgments.
+       */
+      void reset()
+      {
+        for (size_t i = 0; i < MaxPendingAcks; ++i)
+        {
+          m_pending[i].active = false;
+        }
+      }
+
+      /**
+       * @brief Finds a free pending-ACK slot.
+       * @return Slot index on success, -1 if no slot is available.
+       */
+      int allocate()
+      {
+        for (size_t i = 0; i < MaxPendingAcks; ++i)
+        {
+          if (!m_pending[i].active)
+            return static_cast<int>(i);
+        }
+        return -1;
+      }
+
+      /**
+       * @brief Gets a tracked pending-ACK entry by index.
+       * @param index Slot index returned by allocate().
+       * @return Pointer to the entry, or nullptr when index is out of range.
+       */
+      PendingAck *get(int index)
+      {
+        if (index < 0 || index >= static_cast<int>(MaxPendingAcks))
+          return nullptr;
+        return &m_pending[index];
+      }
+
+      /**
+       * @brief Clears the first pending entry matching message identity and peer.
+       * @param msg_id Message ID.
+       * @param seq_id Sequence ID.
+       * @param dest_ip Destination IP tracked for the pending packet.
+       * @param dest_port Destination port tracked for the pending packet.
+       */
+      void clear(uint8_t msg_id, uint8_t seq_id, uint32_t dest_ip,
+                 uint16_t dest_port)
+      {
+        for (size_t i = 0; i < MaxPendingAcks; ++i)
+        {
+          auto &pend = m_pending[i];
+          if (pend.active && pend.msg_id == msg_id && pend.seq_id == seq_id &&
+              pend.dest_ip == dest_ip && pend.dest_port == dest_port)
+          {
+            pend.active = false;
+            break;
+          }
+        }
+      }
+
+      /**
+       * @brief Processes retransmissions and timeout failures for active entries.
+       * @tparam MsgCount Size of the message registry.
+       * @param transport Transport implementation used for retransmission.
+       * @param now_ms Current monotonic tick in milliseconds.
+       * @param registry Message registry indexed by msg_id.
+       */
+      template <size_t MsgCount>
+      void tick(ITransport &transport, uint32_t now_ms,
+                IMessage *const (&registry)[MsgCount])
+      {
+        for (size_t i = 0; i < MaxPendingAcks; ++i)
+        {
+          auto &pend = m_pending[i];
+          if (!pend.active)
+            continue;
+
+          IMessage *item = registry[pend.msg_id];
+          if (!item)
+          {
+            pend.active = false;
+            continue;
+          }
+
+          // Handle unsigned 32-bit timestamp wraparound safely
+          if ((now_ms - pend.last_tx_ms) >= item->retry_delay_ms())
+          {
+            if (pend.retries_remaining > 0)
+            {
+              pend.retries_remaining--;
+              pend.last_tx_ms = now_ms;
+              transport.send(pend.packet, pend.packet_len, pend.dest_ip,
+                             pend.dest_port);
+            }
+            else
+            {
+              // Exhausted all transmission attempts
+              pend.active = false;
+              item->on_fail();
+            }
+          }
+        }
+      }
+
+    private:
+      PendingAck m_pending[MaxPendingAcks] = {};
+    };
+
+  } // namespace internal
+
+  /**
+   * @brief The core LUCP Protocol Node.
+   * Fully templated to ensure zero dynamic allocation.
+   */
+  template <size_t MsgCount = 256, size_t EchoQueueDepth = 16,
+            size_t MaxPendingAcks = 4, size_t MaxPayloadSize = 256,
+            size_t MaxRecvBurst = 64>
+  class Node : public INode
+  {
+  public:
+    explicit Node(ITransport &transport) : m_transport(transport) { reset(); }
+
+    /**
+     * @brief Resets registry state, sequence counters, ACK tracking, and echo queue.
+     */
+    void reset()
+    {
+      for (size_t i = 0; i < MsgCount; ++i)
+      {
+        m_registry[i] = nullptr;
+        m_seq_id[i] = 0;
+      }
+      m_ack_manager.reset();
+      m_echo_queue.reset();
+    }
+
+    /**
+     * @brief Register a strong-typed message object.
+     */
+    int register_message(IMessage *msg)
+    {
+      if (!msg)
+        return ERR_BAD_ARG;
+      uint8_t msg_id = msg->id();
+      if (msg_id == 0 || msg_id >= MsgCount)
+        return ERR_INVALID_ID;
+      if (msg->size() == 0 || msg->size() > MaxPayloadSize)
+        return ERR_BAD_ARG;
+
+      msg->set_node(this);
+      m_registry[msg_id] = msg;
+      return OK;
+    }
+
+    /**
+     * @brief Dispatch raw bytes for a message ID (override from INode).
+     * @warning This function allocates `HEADER_SIZE + MaxPayloadSize` bytes on
+     * the stack to construct the packet before sending. On highly constrained
+     * devices (e.g. RP2040), ensure `MaxPayloadSize` bounded to avoid stack
+     * overflows.
+     */
+    int send_raw(uint8_t msg_id, const uint8_t *payload, uint16_t payload_size,
+                 uint32_t dest_ip, uint16_t dest_port) override
+    {
+      if (msg_id == 0 || msg_id >= MsgCount)
+        return ERR_INVALID_ID;
+
+      IMessage *item = m_registry[msg_id];
+      if (!item)
+        return ERR_INVALID_ID; // Unregistered
+
+      const uint16_t expected_size = item->size();
+      const bool requires_ack = item->ack_required();
+
+      // Validate payload size against registered size
+      if (payload_size != expected_size)
+        return ERR_BAD_ARG;
+
+      const size_t packet_len = HEADER_SIZE + expected_size;
+      if (expected_size > MaxPayloadSize)
+        return ERR_BAD_ARG;
+
+      // Assign the next rolling sequence ID (wraps at 256)
+      uint8_t seq_id = m_seq_id[msg_id]++;
+
+      // Build the packet directly on the runtime stack
+      uint8_t packet[HEADER_SIZE + MaxPayloadSize];
+      packet[0] = MAGIC_0;
+      packet[1] = MAGIC_1;
+      packet[2] = msg_id;
+      packet[3] = seq_id;
+
+      // Copy payload after the 4 byte header
+      if (expected_size > 0)
+      {
+        if (payload == nullptr)
+          return ERR_BAD_ARG;
+        std::memcpy(packet + HEADER_SIZE, payload, expected_size);
+      }
+
+      // If ACK required, add to ACK manager
+      if (requires_ack)
+      {
+        int pending_idx = m_ack_manager.allocate();
+        if (pending_idx < 0)
+          return ERR_QUEUE_FULL;
+
+        auto *pend = m_ack_manager.get(pending_idx);
+        pend->msg_id = msg_id;
+        pend->seq_id = seq_id;
+        pend->dest_ip = dest_ip;
+        pend->dest_port = dest_port;
+        pend->retries_remaining = item->max_retries();
+        pend->packet_len = static_cast<uint16_t>(packet_len);
+        pend->last_tx_ms = m_transport.now_ms();
+        std::memcpy(pend->packet, packet, packet_len);
+        pend->active = true;
+      }
+
+      // Send packet via transport PAL
+      int rc = m_transport.send(packet, static_cast<uint16_t>(packet_len),
+                                dest_ip, dest_port);
+
+      // If send fails, clear ACK manager
+      if (rc < 0)
+      {
+        if (requires_ack)
+        {
+          m_ack_manager.clear(msg_id, seq_id, dest_ip, dest_port);
+        }
+        return rc;
+      }
+      return OK;
+    }
+
+    /**
+     * @brief Validates and dispatches a single received packet.
+     *
+     * Header-only packets are treated as ACK confirmations for reliable
+     * messages. Payload packets are dispatched to the registered message
+     * handler and may enqueue an ACK echo when reliability is enabled.
+     *
+     * @param packet Packet bytes from the transport.
+     * @param size Packet length in bytes.
+     * @param source_ip Source IP address reported by the transport.
+     * @param source_port Source port reported by the transport.
+     */
+    void process_packet(const uint8_t *packet, uint16_t size, uint32_t source_ip,
+                        uint16_t source_port)
+    {
+      // Check magic bytes and minimum size
+      if (!packet || size < HEADER_SIZE)
+        return;
+      if (packet[0] != MAGIC_0 || packet[1] != MAGIC_1)
+        return;
+
+      // Extract message ID and sequence ID
+      uint8_t msg_id = packet[2];
+      uint8_t seq_id = packet[3];
+
+      // Check if message ID is valid
+      if (msg_id == 0 || msg_id >= MsgCount)
+      {
+        m_transport.log_unknown(msg_id, source_ip, source_port);
+        return;
+      }
+
+      // Get message handler
+      IMessage *item = m_registry[msg_id];
+      if (!item)
+      {
+        m_transport.log_unknown(msg_id, source_ip, source_port);
+        return;
+      }
+
+      const uint16_t expected_size = item->size();
+      const bool requires_ack = item->ack_required();
+
+      // Reject zero-sized messages
+      if (expected_size == 0)
+      {
+        uint16_t received = size - HEADER_SIZE;
+        m_transport.log_rejected(msg_id, received, 1);
+        return;
+      }
+
+      // Check if this is an ACK (header only)
+      if (size == HEADER_SIZE)
+      {
+        if (!requires_ack)
+        {
+          m_transport.log_rejected(msg_id, 0, expected_size);
+          return;
+        }
+        m_ack_manager.clear(msg_id, seq_id, source_ip, source_port);
+        return;
+      }
+
+      // Validate payload size
+      uint16_t payload_size = size - HEADER_SIZE;
+      if (payload_size != expected_size)
+      {
+        m_transport.log_rejected(msg_id, payload_size, expected_size);
+        return;
+      }
+
+      // Dispatch payload to the correct handler
+      int rc = item->handle(packet + HEADER_SIZE, payload_size);
+      if (rc == ERR_NOT_IMPLEMENTED)
+      {
+        m_transport.log_unknown(msg_id, source_ip, source_port);
+        return;
+      }
+
+      // Add to echo queue if ACK is required
+      if (requires_ack)
+      {
+        int rc = m_echo_queue.enqueue(packet, source_ip, source_port);
+        if (rc == ERR_QUEUE_FULL)
+        {
+          m_transport.log_rejected(msg_id, payload_size, expected_size);
         }
       }
     }
-  }
 
-private:
-  PendingAck m_pending[MaxPendingAcks] = {};
-};
+    /**
+     * @brief Polls the transport for all available incoming packets and processes
+     * them. This method uses a stack buffer of size `HEADER_SIZE +
+     * MaxPayloadSize` bytes; ensure `MaxPayloadSize` is bounded appropriately for
+     * embedded targets.
+     *
+     * Drains at most `MaxRecvBurst` packets per call to prevent starvation in a
+     * main loop if the transport continuously reports data. Enqueues outgoing ACK
+     * echoes but does not flush them - call `flush_echo_queue()` or
+     * `process_all()` to dispatch them.
+     *
+     * The transport's `receive()` implementation MUST populate `src_ip` and
+     * `src_port` whenever it returns a positive byte count.
+     */
+    void receive_incoming()
+    {
+      uint8_t buffer[HEADER_SIZE + MaxPayloadSize];
+      uint32_t src_ip = 0;
+      uint16_t src_port = 0;
 
-} // namespace internal
-
-/**
- * @brief The core LUCP Protocol Node.
- * Fully templated to ensure zero dynamic allocation.
- */
-template <size_t MsgCount = 256, size_t EchoQueueDepth = 16,
-          size_t MaxPendingAcks = 4, size_t MaxPayloadSize = 256,
-          size_t MaxRecvBurst = 64>
-class Node : public INode {
-public:
-  explicit Node(ITransport &transport) : m_transport(transport) { reset(); }
-
-  void reset() {
-    for (size_t i = 0; i < MsgCount; ++i) {
-      m_registry[i] = nullptr;
-      m_seq_id[i] = 0;
-    }
-    m_ack_manager.reset();
-    m_echo_queue.reset();
-  }
-
-  /**
-   * @brief Register a strong-typed message object.
-   */
-  int register_message(IMessage *msg) {
-    if (!msg)
-      return ERR_BAD_ARG;
-    uint8_t msg_id = msg->id();
-    if (msg_id == 0 || msg_id >= MsgCount)
-      return ERR_INVALID_ID;
-    if (msg->size() == 0 || msg->size() > MaxPayloadSize)
-      return ERR_BAD_ARG;
-
-    msg->set_node(this);
-    m_registry[msg_id] = msg;
-    return OK;
-  }
-
-  /**
-   * @brief Dispatch raw bytes for a message ID (override from INode).
-   * @warning This function allocates `HEADER_SIZE + MaxPayloadSize` bytes on
-   * the stack to construct the packet before sending. On highly constrained
-   * devices (e.g. RP2040), ensure `MaxPayloadSize` bounded to avoid stack
-   * overflows.
-   */
-  int send_raw(uint8_t msg_id, const uint8_t *payload, uint16_t payload_size,
-               uint32_t dest_ip, uint16_t dest_port) override {
-    if (msg_id == 0 || msg_id >= MsgCount)
-      return ERR_INVALID_ID;
-
-    IMessage *item = m_registry[msg_id];
-    if (!item)
-      return ERR_INVALID_ID; // Unregistered
-
-    // Validate payload size against registered size
-    if (payload_size != item->size())
-      return ERR_BAD_ARG;
-
-    const size_t packet_len = HEADER_SIZE + item->size();
-    if (item->size() > MaxPayloadSize)
-      return ERR_BAD_ARG;
-
-    // Assign the next rolling sequence ID (wraps at 256)
-    uint8_t seq_id = m_seq_id[msg_id]++;
-
-    // Build the packet directly on the runtime stack
-    uint8_t packet[HEADER_SIZE + MaxPayloadSize];
-    packet[0] = MAGIC_0;
-    packet[1] = MAGIC_1;
-    packet[2] = msg_id;
-    packet[3] = seq_id;
-
-    // Copy payload after the 4 byte header
-    if (item->size() > 0) {
-      if (payload == nullptr)
-        return ERR_BAD_ARG;
-      std::memcpy(packet + HEADER_SIZE, payload, item->size());
-    }
-
-    // If ACK required, add to ACK manager
-    if (item->ack_required()) {
-      int pending_idx = m_ack_manager.allocate();
-      if (pending_idx < 0)
-        return ERR_QUEUE_FULL;
-
-      auto *pend = m_ack_manager.get(pending_idx);
-      pend->msg_id = msg_id;
-      pend->seq_id = seq_id;
-      pend->dest_ip = dest_ip;
-      pend->dest_port = dest_port;
-      pend->retries_remaining = item->max_retries();
-      pend->packet_len = static_cast<uint16_t>(packet_len);
-      pend->last_tx_ms = m_transport.now_ms();
-      std::memcpy(pend->packet, packet, packet_len);
-      pend->active = true;
-    }
-
-    // Send packet via transport PAL
-    int rc = m_transport.send(packet, static_cast<uint16_t>(packet_len),
-                              dest_ip, dest_port);
-
-    // If send fails, clear ACK manager
-    if (rc < 0) {
-      if (item->ack_required()) {
-        m_ack_manager.clear(msg_id, seq_id, dest_ip, dest_port);
+      for (size_t i = 0; i < MaxRecvBurst; ++i)
+      {
+        int len = m_transport.receive(buffer, sizeof(buffer), src_ip, src_port);
+        if (len <= 0)
+          break;
+        process_packet(buffer, static_cast<uint16_t>(len), src_ip, src_port);
       }
-      return rc;
-    }
-    return OK;
-  }
-
-  void process_packet(const uint8_t *packet, uint16_t size, uint32_t source_ip,
-                      uint16_t source_port) {
-    // Check magic bytes and minimum size
-    if (!packet || size < HEADER_SIZE)
-      return;
-    if (packet[0] != MAGIC_0 || packet[1] != MAGIC_1)
-      return;
-
-    // Extract message ID and sequence ID
-    uint8_t msg_id = packet[2];
-    uint8_t seq_id = packet[3];
-
-    // Check if message ID is valid
-    if (msg_id == 0 || msg_id >= MsgCount) {
-      m_transport.log_unknown(msg_id, source_ip, source_port);
-      return;
     }
 
-    // Get message handler
-    IMessage *item = m_registry[msg_id];
-    if (!item) {
-      m_transport.log_unknown(msg_id, source_ip, source_port);
-      return;
+    /**
+     * @brief Processes pending ACK retries and timeout failures.
+     * Iterates all tracked outbound messages and retransmits those whose retry
+     * delay has elapsed. Calls `IMessage::on_fail()` when retries are exhausted.
+     * Should be called on a regular timer (e.g. every 10 ms) or in a main loop.
+     */
+    void ack_tick()
+    {
+      uint32_t now_ms = m_transport.now_ms();
+      m_ack_manager.tick(m_transport, now_ms, m_registry);
     }
 
-    // Reject zero-sized messages
-    if (item->size() == 0) {
-      uint16_t received = size >= HEADER_SIZE ? size - HEADER_SIZE : 0;
-      m_transport.log_rejected(msg_id, received, 1);
-      return;
+    /**
+     * @brief Flushes all queued outgoing ACK echo packets via the transport.
+     * Echoes are enqueued by `receive_incoming()` when a reliable message is
+     * received. This must be called to actually dispatch them. May be called
+     * independently or via `process_all()`.
+     */
+    void flush_echo_queue() { m_echo_queue.flush(m_transport); }
+
+    /**
+     * @brief Convenience method: polls for incoming packets, retries pending
+     * ACKs, and flushes outgoing echo queue in one call. Suitable for simple
+     * main-loop polling where all three operations share the same cadence.
+     *
+     * For interrupt-driven or RTOS designs, prefer calling `receive_incoming()`,
+     * `ack_tick()`, and `flush_echo_queue()` independently at their respective
+     * rates.
+     */
+    void process_all()
+    {
+      receive_incoming();
+      ack_tick();
+      flush_echo_queue();
     }
 
-    // Check if this is an ACK (header only)
-    if (size == HEADER_SIZE) {
-      if (!item->ack_required()) {
-        m_transport.log_rejected(msg_id, 0, item->size());
-        return;
-      }
-      m_ack_manager.clear(msg_id, seq_id, source_ip, source_port);
-      return;
-    }
+  private:
+    ITransport &m_transport;
 
-    // Validate payload size
-    uint16_t payload_size = size - HEADER_SIZE;
-    if (payload_size != item->size()) {
-      m_transport.log_rejected(msg_id, payload_size, item->size());
-      return;
-    }
+    IMessage *m_registry[MsgCount] = {};
+    uint8_t m_seq_id[MsgCount] = {};
 
-    // If an ACK is required, drop it if we cannot echo
-    if (item->ack_required() && m_echo_queue.is_full()) {
-      return;
-    }
-
-    // Dispatch payload to the correct handler
-    int rc = item->handle(packet + HEADER_SIZE, payload_size);
-    if (rc == ERR_NOT_IMPLEMENTED) {
-      m_transport.log_unknown(msg_id, source_ip, source_port);
-      return;
-    }
-
-    // Add to echo queue if ACK is required
-    if (item->ack_required()) {
-      m_echo_queue.enqueue(packet, source_ip, source_port);
-    }
-  }
-
-  /**
-   * @brief Polls the transport for all available incoming packets and processes
-   * them. This method uses a stack buffer of size `HEADER_SIZE +
-   * MaxPayloadSize` bytes; ensure `MaxPayloadSize` is bounded appropriately for
-   * embedded targets.
-   *
-   * Drains at most `MaxRecvBurst` packets per call to prevent starvation in a
-   * main loop if the transport continuously reports data. Enqueues outgoing ACK
-   * echoes but does not flush them — call `flush_echo_queue()` or
-   * `process_all()` to dispatch them.
-   *
-   * The transport's `receive()` implementation MUST populate `src_ip` and
-   * `src_port` whenever it returns a positive byte count.
-   */
-  void receive_incoming() {
-    uint8_t buffer[HEADER_SIZE + MaxPayloadSize];
-    uint32_t src_ip = 0;
-    uint16_t src_port = 0;
-
-    for (size_t i = 0; i < MaxRecvBurst; ++i) {
-      int len = m_transport.receive(buffer, sizeof(buffer), src_ip, src_port);
-      if (len <= 0)
-        break;
-      process_packet(buffer, static_cast<uint16_t>(len), src_ip, src_port);
-    }
-  }
-
-  /**
-   * @brief Processes pending ACK retries and timeout failures.
-   * Iterates all tracked outbound messages and retransmits those whose retry
-   * delay has elapsed. Calls `IMessage::on_fail()` when retries are exhausted.
-   * Should be called on a regular timer (e.g. every 10 ms) or in a main loop.
-   */
-  void ack_tick() {
-    uint32_t now_ms = m_transport.now_ms();
-    m_ack_manager.tick(m_transport, now_ms, m_registry);
-  }
-
-  /**
-   * @brief Flushes all queued outgoing ACK echo packets via the transport.
-   * Echoes are enqueued by `receive_incoming()` when a reliable message is
-   * received. This must be called to actually dispatch them. May be called
-   * independently or via `process_all()`.
-   */
-  void flush_echo_queue() { m_echo_queue.flush(m_transport); }
-
-  /**
-   * @brief Convenience method: polls for incoming packets, retries pending
-   * ACKs, and flushes outgoing echo queue in one call. Suitable for simple
-   * main-loop polling where all three operations share the same cadence.
-   *
-   * For interrupt-driven or RTOS designs, prefer calling `receive_incoming()`,
-   * `ack_tick()`, and `flush_echo_queue()` independently at their respective
-   * rates.
-   */
-  void process_all() {
-    receive_incoming();
-    ack_tick();
-    flush_echo_queue();
-  }
-
-private:
-  ITransport &m_transport;
-
-  IMessage *m_registry[MsgCount] = {};
-  uint8_t m_seq_id[MsgCount] = {};
-
-  internal::EchoQueue<EchoQueueDepth> m_echo_queue;
-  internal::AckManager<MaxPendingAcks, MaxPayloadSize> m_ack_manager;
-};
+    internal::EchoQueue<EchoQueueDepth> m_echo_queue;
+    internal::AckManager<MaxPendingAcks, MaxPayloadSize> m_ack_manager;
+  };
 
 } // namespace lucp

@@ -2,14 +2,16 @@
 
 #include <cstdint>
 
-namespace lucp {
+namespace lucp
+{
 
-/**
- * @brief Platform Abstraction Layer for network transport and time.
- * Implement this interface for your specific hardware (e.g., Arduino EthernetUDP, ESP-IDF sockets, Linux sockets).
- */
-class ITransport {
-public:
+  /**
+   * @brief Platform Abstraction Layer for network transport and time.
+   * Implement this interface for your specific hardware (e.g., Arduino EthernetUDP, ESP-IDF sockets, Linux sockets).
+   */
+  class ITransport
+  {
+  public:
     virtual ~ITransport() = default;
 
     /**
@@ -20,7 +22,7 @@ public:
      * @param port Destination port number in host byte order.
      * @return Number of bytes sent, or a negative error code (e.g. protocol::ERR_PAL_SEND).
      */
-    virtual int send(const uint8_t* buf, uint16_t len, uint32_t ip, uint16_t port) = 0;
+    virtual int send(const uint8_t *buf, uint16_t len, uint32_t ip, uint16_t port) = 0;
 
     /**
      * @brief Receives one incoming UDP packet, non-blocking.
@@ -34,9 +36,13 @@ public:
      *       transports that feed data directly via `Node::process_packet()` may leave this
      *       as the default and skip calling `Node::receive_incoming()` entirely.
      */
-    virtual int receive(uint8_t* buf, uint16_t max_len, uint32_t& src_ip, uint16_t& src_port) {
-        (void)buf; (void)max_len; (void)src_ip; (void)src_port;
-        return 0;
+    virtual int receive(uint8_t *buf, uint16_t max_len, uint32_t &src_ip, uint16_t &src_port)
+    {
+      (void)buf;
+      (void)max_len;
+      (void)src_ip;
+      (void)src_port;
+      return 0;
     }
 
     /**
@@ -48,7 +54,7 @@ public:
     /**
      * @brief Optional: Log general debug messages.
      */
-    virtual void log_debug(const char* /*fmt*/, ...) {}
+    virtual void log_debug(const char * /*fmt*/, ...) {}
 
     /**
      * @brief Optional: Log when an unregistered message ID is received.
@@ -59,6 +65,6 @@ public:
      * @brief Optional: Log when a message is rejected due to size mismatch.
      */
     virtual void log_rejected(uint8_t /*msg_id*/, uint16_t /*received_size*/, uint16_t /*expected_size*/) {}
-};
+  };
 
 } // namespace lucp
