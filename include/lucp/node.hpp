@@ -54,14 +54,11 @@ namespace lucp
         if (m_count >= EchoQueueDepth)
           return ERR_QUEUE_FULL;
 
-        // Construct the echo header (magic bytes + msg_id + seq_id)
-        uint8_t header[HEADER_SIZE] = {MAGIC_0, MAGIC_1, packet[2], packet[3]};
-
         // Store the echo record in the circular queue
         auto &echo = m_queue[m_tail];
         echo.dest_ip = dest_ip;
         echo.dest_port = dest_port;
-        std::memcpy(echo.header, header, HEADER_SIZE);
+        std::memcpy(echo.header, packet, HEADER_SIZE);
 
         // Advance tail and increment count
         m_tail = (m_tail + 1) % EchoQueueDepth;
