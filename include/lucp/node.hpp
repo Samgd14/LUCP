@@ -318,8 +318,11 @@ namespace lucp
         std::memcpy(packet + HEADER_SIZE, payload, expected_size);
       }
 
-      // If ACK required, add to ACK manager
-      if (requires_ack)
+      // Send packet via transport PAL
+      int rc = m_transport.send(packet, static_cast<uint16_t>(packet_len), dest_ip, dest_port);
+
+      // If send succeeds, add to ACK tracking if required
+      if (rc >= 0 && requires_ack)
       {
         int pending_idx = m_ack_manager.allocate();
         if (pending_idx < 0)
@@ -337,20 +340,7 @@ namespace lucp
         pend->active = true;
       }
 
-      // Send packet via transport PAL
-      int rc = m_transport.send(packet, static_cast<uint16_t>(packet_len),
-                                dest_ip, dest_port);
-
-      // If send fails, clear ACK manager
-      if (rc < 0)
-      {
-        if (requires_ack)
-        {
-          m_ack_manager.clear(msg_id, seq_id, dest_ip, dest_port);
-        }
-        return rc;
-      }
-      return OK;
+      return rc;
     }
 
     /**
