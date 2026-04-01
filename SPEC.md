@@ -154,7 +154,7 @@ It clears a pending record only when all fields match:
 - source `ip`
 - source `port`
 
-ACKs for non-ack-required messages are rejected (`log_rejected`).
+ACKs for non-ack-required messages return `ERR_INVALID_PACKET`.
 
 ### 6.3 Retry and Exhaustion
 
@@ -183,14 +183,18 @@ If the echo queue is full, the packet is dropped before `handle()` is called.
 1. Drop packet if null or shorter than header.
 2. Validate magic bytes.
 3. Validate `msg_id` (`1..MsgCount-1`) and lookup registered message.
-4. Reject registered messages whose declared `size()` is zero.
+4. Return an error code for invalid/unregistered messages.
 5. If `size == HEADER_SIZE`, process as ACK path.
 6. Otherwise require payload size exactly equal to `IMessage::size()`.
 7. Call `handle(payload, payload_size)`.
 8. For ack-required messages, queue echo ACK (unless queue full).
 
-Unknown or unregistered IDs call `ITransport::log_unknown(...)`.
-Size mismatch cases call `ITransport::log_rejected(...)`.
+`Node::process_packet(...)` does not emit transport diagnostics hooks directly.
+It only returns LUCP error codes.
+
+`Node::receive_incoming()` is the boundary that logs protocol failures by invoking
+`ITransport::log_error(error_code, src_ip, src_port)` when
+`process_packet(...)` returns a non-zero error.
 
 ---
 
@@ -213,8 +217,7 @@ Optional diagnostics hooks:
 
 ```cpp
 virtual void log_debug(const char* fmt, ...);
-virtual void log_unknown(uint8_t msg_id, uint32_t src_ip, uint16_t src_port);
-virtual void log_rejected(uint8_t msg_id, uint16_t received_size, uint16_t expected_size);
+virtual void log_error(int error_code, uint32_t src_ip, uint16_t src_port);
 ```
 
 The protocol core does not enforce byte order conversion of IP values; applications should keep sender/receiver conventions consistent.

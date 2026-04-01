@@ -4,7 +4,7 @@
 
 namespace lucp
 {
-
+  // Protocol constants
   constexpr uint8_t MAGIC_0 = 0xFA;
   constexpr uint8_t MAGIC_1 = 0x51;
   constexpr uint16_t HEADER_SIZE = 4;
@@ -16,5 +16,7 @@ namespace lucp
   constexpr int ERR_PAL_SEND = -3;
   constexpr int ERR_BAD_ARG = -4;
   constexpr int ERR_NOT_IMPLEMENTED = -5;
+  constexpr int ERR_INVALID_PACKET = -6;
+  constexpr int ERR_PACKET_TOO_LARGE = -7;
 
 } // namespace lucp

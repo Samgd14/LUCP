@@ -63,7 +63,7 @@ namespace lucp
         // Advance tail and increment count
         m_tail = (m_tail + 1) % EchoQueueDepth;
         m_count++;
-        return true;
+        return OK;
       }
 
       /**
@@ -195,15 +195,15 @@ namespace lucp
           if (!pend.active)
             continue;
 
-          IMessage *item = registry[pend.msg_id];
-          if (!item)
+          IMessage *msg = registry[pend.msg_id];
+          if (!msg)
           {
             pend.active = false;
             continue;
           }
 
           // Handle unsigned 32-bit timestamp wraparound safely
-          if ((now_ms - pend.last_tx_ms) >= item->retry_delay_ms())
+          if ((now_ms - pend.last_tx_ms) >= msg->retry_delay_ms())
           {
             if (pend.retries_remaining > 0)
             {
@@ -216,7 +216,7 @@ namespace lucp
             {
               // Exhausted all transmission attempts
               pend.active = false;
-              item->on_fail();
+              msg->on_fail();
             }
           }
         }
@@ -238,6 +238,9 @@ namespace lucp
   class Node : public INode
   {
   public:
+    static_assert(MsgCount <= 256, "MsgCount cannot exceed 256 because msg_id is uint8_t.");
+    static_assert(MaxPendingAcks < 256, "MaxPendingAcks must be < 256 to avoid seq_id aliasing.");
+
     explicit Node(ITransport &transport) : m_transport(transport) { reset(); }
 
     /**
@@ -272,6 +275,20 @@ namespace lucp
       return OK;
     }
 
+    IMessage *get_registered_message(uint8_t msg_id) const
+    {
+      // Validate msg_id is within valid range (0 is reserved)
+      if (msg_id == 0 || msg_id >= MsgCount)
+        return nullptr;
+
+      // Check if message is actually registered in the registry
+      IMessage *msg = m_registry[msg_id];
+      if (!msg)
+        return nullptr;
+
+      return msg;
+    }
+
     /**
      * @brief Dispatch raw bytes for a message ID (override from INode).
      * @warning This function allocates `HEADER_SIZE + MaxPayloadSize` bytes on
@@ -282,23 +299,31 @@ namespace lucp
     int send_raw(uint8_t msg_id, const uint8_t *payload, uint16_t payload_size,
                  uint32_t dest_ip, uint16_t dest_port) override
     {
-      if (msg_id == 0 || msg_id >= MsgCount)
+      // Get registered message instance for this ID
+      IMessage *msg = get_registered_message(msg_id);
+      if (!msg)
         return ERR_INVALID_ID;
 
-      IMessage *item = m_registry[msg_id];
-      if (!item)
-        return ERR_INVALID_ID; // Unregistered
-
-      const uint16_t expected_size = item->size();
-      const bool requires_ack = item->ack_required();
+      const uint16_t expected_size = msg->size();
+      const bool requires_ack = msg->ack_required();
+      const uint16_t packet_len = static_cast<uint16_t>(HEADER_SIZE + expected_size);
 
       // Validate payload size against registered size
       if (payload_size != expected_size)
         return ERR_BAD_ARG;
 
-      const size_t packet_len = HEADER_SIZE + expected_size;
-      if (expected_size > MaxPayloadSize)
-        return ERR_BAD_ARG;
+      // Reserve an ACK slot up front for reliable messages.
+      int pending_idx = -1;
+      typename internal::AckManager<MaxPendingAcks, MaxPayloadSize>::PendingAck *pend = nullptr;
+      if (requires_ack)
+      {
+        pending_idx = m_ack_manager.allocate();
+        if (pending_idx < 0)
+          return ERR_QUEUE_FULL;
+        pend = m_ack_manager.get(pending_idx);
+        if (!pend)
+          return ERR_BAD_ARG;
+      }
 
       // Assign the next rolling sequence ID (wraps at 256)
       uint8_t seq_id = m_seq_id[msg_id]++;
@@ -319,118 +344,108 @@ namespace lucp
       }
 
       // Send packet via transport PAL
-      int rc = m_transport.send(packet, static_cast<uint16_t>(packet_len), dest_ip, dest_port);
+      int rc = m_transport.send(packet, packet_len, dest_ip, dest_port);
+      if (rc < 0)
+        return rc;
+      if (rc != static_cast<int>(packet_len))
+        return ERR_PAL_SEND;
 
       // If send succeeds, add to ACK tracking if required
-      if (rc >= 0 && requires_ack)
+      if (requires_ack)
       {
-        int pending_idx = m_ack_manager.allocate();
-        if (pending_idx < 0)
-          return ERR_QUEUE_FULL;
-
-        auto *pend = m_ack_manager.get(pending_idx);
         pend->msg_id = msg_id;
         pend->seq_id = seq_id;
         pend->dest_ip = dest_ip;
         pend->dest_port = dest_port;
-        pend->retries_remaining = item->max_retries();
-        pend->packet_len = static_cast<uint16_t>(packet_len);
+        pend->retries_remaining = msg->max_retries();
+        pend->packet_len = packet_len;
         pend->last_tx_ms = m_transport.now_ms();
         std::memcpy(pend->packet, packet, packet_len);
         pend->active = true;
       }
 
-      return rc;
+      return OK;
     }
 
     /**
      * @brief Validates and dispatches a single received packet.
+     * @note Node is not thread-safe. Calls that mutate state must be externally
+     * synchronized when used from multiple contexts.
      *
      * Header-only packets are treated as ACK confirmations for reliable
      * messages. Payload packets are dispatched to the registered message
      * handler and may enqueue an ACK echo when reliability is enabled.
+     *
+     * @return OK (0) on successful handling, or an error code.
      *
      * @param packet Packet bytes from the transport.
      * @param size Packet length in bytes.
      * @param source_ip Source IP address reported by the transport.
      * @param source_port Source port reported by the transport.
      */
-    void process_packet(const uint8_t *packet, uint16_t size, uint32_t source_ip,
-                        uint16_t source_port)
+    int process_packet(const uint8_t *packet, uint16_t size, uint32_t source_ip,
+                       uint16_t source_port)
     {
-      // Check magic bytes and minimum size
+      // Check for null pointer and minimum size
       if (!packet || size < HEADER_SIZE)
-        return;
+        return ERR_BAD_ARG;
+
+      // Check magic bytes
       if (packet[0] != MAGIC_0 || packet[1] != MAGIC_1)
-        return;
+        return ERR_INVALID_PACKET;
+
+      // Check for packet size exceeding maximum allowed
+      if (size > (HEADER_SIZE + MaxPayloadSize))
+        return ERR_PACKET_TOO_LARGE;
 
       // Extract message ID and sequence ID
       uint8_t msg_id = packet[2];
       uint8_t seq_id = packet[3];
 
-      // Check if message ID is valid
-      if (msg_id == 0 || msg_id >= MsgCount)
-      {
-        m_transport.log_unknown(msg_id, source_ip, source_port);
-        return;
-      }
-
       // Get message handler
-      IMessage *item = m_registry[msg_id];
-      if (!item)
+      IMessage *msg = get_registered_message(msg_id);
+      if (!msg)
       {
-        m_transport.log_unknown(msg_id, source_ip, source_port);
-        return;
+        return ERR_INVALID_ID;
       }
 
-      const uint16_t expected_size = item->size();
-      const bool requires_ack = item->ack_required();
-
-      // Reject zero-sized messages
-      if (expected_size == 0)
-      {
-        uint16_t received = size - HEADER_SIZE;
-        m_transport.log_rejected(msg_id, received, 1);
-        return;
-      }
+      const uint16_t expected_size = msg->size();
+      const bool requires_ack = msg->ack_required();
 
       // Check if this is an ACK (header only)
       if (size == HEADER_SIZE)
       {
         if (!requires_ack)
         {
-          m_transport.log_rejected(msg_id, 0, expected_size);
-          return;
+          return ERR_INVALID_PACKET;
         }
         m_ack_manager.clear(msg_id, seq_id, source_ip, source_port);
-        return;
+        return OK;
       }
 
       // Validate payload size
       uint16_t payload_size = size - HEADER_SIZE;
       if (payload_size != expected_size)
       {
-        m_transport.log_rejected(msg_id, payload_size, expected_size);
-        return;
+        return ERR_INVALID_PACKET;
+      }
+
+      // If ACK is required but echo queue is full, drop the packet immediately
+      if (requires_ack && m_echo_queue.is_full())
+      {
+        return ERR_QUEUE_FULL;
       }
 
       // Dispatch payload to the correct handler
-      int rc = item->handle(packet + HEADER_SIZE, payload_size);
-      if (rc == ERR_NOT_IMPLEMENTED)
-      {
-        m_transport.log_unknown(msg_id, source_ip, source_port);
-        return;
-      }
+      int rc = msg->handle(packet + HEADER_SIZE, payload_size);
+      if (rc != OK)
+        return rc;
 
-      // Add to echo queue if ACK is required
+      // Enqueue an ACK echo if required
       if (requires_ack)
-      {
-        int rc = m_echo_queue.enqueue(packet, source_ip, source_port);
-        if (rc == ERR_QUEUE_FULL)
-        {
-          m_transport.log_rejected(msg_id, payload_size, expected_size);
-        }
-      }
+        rc = m_echo_queue.enqueue(packet, source_ip, source_port);
+
+      return rc;
     }
 
     /**
@@ -458,7 +473,10 @@ namespace lucp
         int len = m_transport.receive(buffer, sizeof(buffer), src_ip, src_port);
         if (len <= 0)
           break;
-        process_packet(buffer, static_cast<uint16_t>(len), src_ip, src_port);
+
+        int rc = process_packet(buffer, static_cast<uint16_t>(len), src_ip, src_port);
+        if (rc != OK)
+          m_transport.log_error(rc, src_ip, src_port);
       }
     }
 

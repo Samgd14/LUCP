@@ -52,19 +52,12 @@ namespace lucp
     virtual uint32_t now_ms() = 0;
 
     /**
-     * @brief Optional: Log general debug messages.
+     * @brief Optional: Log LUCP protocol/runtime errors by error code.
+     *
+     * Should be called at a higher-level boundary (e.g. receive loop),
+     * not deep into packet-validation.
      */
-    virtual void log_debug(const char * /*fmt*/, ...) {}
-
-    /**
-     * @brief Optional: Log when an unregistered message ID is received.
-     */
-    virtual void log_unknown(uint8_t /*msg_id*/, uint32_t /*src_ip*/, uint16_t /*src_port*/) {}
-
-    /**
-     * @brief Optional: Log when a message is rejected due to size mismatch.
-     */
-    virtual void log_rejected(uint8_t /*msg_id*/, uint16_t /*received_size*/, uint16_t /*expected_size*/) {}
+    virtual void log_error(int error_code, uint32_t src_ip, uint16_t src_port) {}
   };
 
 } // namespace lucp
