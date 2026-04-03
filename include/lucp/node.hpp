@@ -133,32 +133,6 @@ namespace lucp
       }
 
       /**
-       * @brief Finds a free pending-ACK slot.
-       * @return Slot index on success, -1 if no slot is available.
-       */
-      int allocate()
-      {
-        for (size_t i = 0; i < MaxPendingAcks; ++i)
-        {
-          if (!m_pending[i].active)
-            return static_cast<int>(i);
-        }
-        return -1;
-      }
-
-      /**
-       * @brief Gets a tracked pending-ACK entry by index.
-       * @param index Slot index returned by allocate().
-       * @return Pointer to the entry, or nullptr when index is out of range.
-       */
-      PendingAck *get(int index)
-      {
-        if (index < 0 || index >= static_cast<int>(MaxPendingAcks))
-          return nullptr;
-        return &m_pending[index];
-      }
-
-      /**
        * @brief Gets the next inactive pending-ACK entry.
        * @return Pointer to the entry, or nullptr if no inactive entries.
        */
@@ -343,16 +317,16 @@ namespace lucp
     int send_raw(uint8_t msg_id, const uint8_t *payload, uint16_t payload_size,
                  uint32_t dest_ip, uint16_t dest_port) override
     {
-      // Reject null payload
-      if (payload == nullptr)
-        return ERR_BAD_ARG;
-
       // Get registered message instance for this ID
       IMessage *msg = get_registered_message(msg_id);
       if (!msg)
         return ERR_INVALID_ID;
 
       const uint16_t expected_size = msg->size();
+
+      // Reject null payload
+      if (expected_size > 0 && payload == nullptr)
+        return ERR_BAD_ARG;
 
       // Validate payload size against registered size
       if (payload_size != expected_size)
@@ -370,11 +344,15 @@ namespace lucp
           return ERR_QUEUE_FULL;
       }
 
-      // Assign the next rolling sequence ID (wraps at 256)
-      uint8_t seq_id = m_seq_id[msg_id] + 1;
+      // For ack-required messages, build directly into the pending slot's buffer
+      // For fire-and-forget messages, use a local stack buffer.
+      uint8_t stack_packet[HEADER_SIZE + MaxPayloadSize];
+      uint8_t *packet = requires_ack ? pend->packet : stack_packet;
+
+      // Get the sequence ID
+      uint8_t seq_id = m_seq_id[msg_id];
 
       // Build the packet
-      uint8_t packet[HEADER_SIZE + MaxPayloadSize];
       packet[0] = MAGIC_0;
       packet[1] = MAGIC_1;
       packet[2] = msg_id;
@@ -403,7 +381,6 @@ namespace lucp
         pend->retries_remaining = msg->max_retries();
         pend->packet_len = packet_len;
         pend->last_tx_ms = m_transport.now_ms();
-        std::memcpy(pend->packet, packet, packet_len);
         pend->active = true;
       }
 

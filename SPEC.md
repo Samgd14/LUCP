@@ -169,7 +169,7 @@ For inbound data packets of ack-required messages:
 
 1. Payload is validated.
 2. `handle()` is called.
-3. If `handle()` does not return `ERR_NOT_IMPLEMENTED`, the original 4-byte header is queued for echo.
+3. If `handle()` does not return an error, the original 4-byte header is queued for echo.
 4. Echo headers are dispatched when `flush_echo_queue()` (or `process_all()`) is called.
 
 If the echo queue is full, the packet is dropped before `handle()` is called.
