@@ -75,6 +75,8 @@ namespace lucp
       /**
        * @brief Sends all queued echo records through the transport.
        * @param transport Transport implementation used for packet transmission.
+       * After flushing, the queue is cleared and ready for new records.
+       * Logs transport errors but continues flushing remaining records.
        */
       void flush(ITransport &transport)
       {
@@ -83,7 +85,10 @@ namespace lucp
           const auto &echo = m_queue[m_head];
           int rc = transport.send(echo.header, HEADER_SIZE, echo.dest_ip, echo.dest_port);
           if (rc < 0)
+          {
             transport.log_error(rc, echo.dest_ip, echo.dest_port);
+            transport.log_error(ERR_CANNOT_ECHO, echo.dest_ip, echo.dest_port);
+          }
           m_head = (m_head + 1) % EchoQueueDepth;
           m_count--;
         }
@@ -178,6 +183,9 @@ namespace lucp
       template <size_t MsgCount>
       void tick(ITransport &transport, uint32_t now_ms, IMessage *const (&registry)[MsgCount])
       {
+        uint32_t current_ip = 0;
+        uint16_t current_port = 0;
+
         for (size_t i = 0; i < MaxPendingAcks; ++i)
         {
           auto &pend = m_pending[i];
@@ -200,10 +208,12 @@ namespace lucp
             else
             {
               // Exhausted all transmission attempts
+              current_ip = pend.dest_ip;
+              current_port = pend.dest_port;
               pend.active = false;
               int rc = msg->on_fail();
               if (rc < 0)
-                transport.log_error(rc, pend.dest_ip, pend.dest_port);
+                transport.log_error(rc, current_ip, current_port);
             }
           }
         }
@@ -228,7 +238,7 @@ namespace lucp
     static_assert(MsgCount > 1, "MsgCount must be greater than 1 to allow registration of messages (ID 0 is reserved).");
     static_assert(MsgCount <= 256, "MsgCount cannot exceed 256 because msg_id is uint8_t.");
     static_assert(MaxPendingAcks > 0, "MaxPendingAcks must be greater than 0 to allow tracking of messages.");
-    static_assert(MaxPendingAcks < 256, "MaxPendingAcks must be < 256 to avoid seq_id aliasing.");
+    static_assert(MaxPendingAcks < 256, "MaxPendingAcks cannot exceed 256 because msg_id is uint8_t.");
     static_assert(MaxPayloadSize > 0, "MaxPayloadSize must be greater than 0 to allow messages with payloads.");
     static_assert(MaxPayloadSize <= 1024, "MaxPayloadSize must be reasonably bounded to avoid stack overflow in send_raw and receive_incoming.");
     static_assert(MaxRecvBurst > 0, "MaxRecvBurst must be greater than 0 to allow processing of incoming packets.");
@@ -281,6 +291,10 @@ namespace lucp
       uint16_t msg_size = msg->size();
       if (msg_size == 0 || msg_size > MaxPayloadSize)
         return ERR_INVALID_SIZE;
+
+      // Check if the message ID is already registered
+      if (m_registry[msg_id])
+        return ERR_ALREADY_REGISTERED;
 
       // Register the message
       msg->set_node(this);
