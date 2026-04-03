@@ -46,7 +46,7 @@ namespace lucp
        * @param packet The received packet to acknowledge.
        * @param dest_ip The destination IP address.
        * @param dest_port The destination port.
-       * @return True if the record was enqueued, false if the queue is full.
+       * @return OK (0) on success, or ERR_QUEUE_FULL if the ACK queue is full.
        */
       int enqueue(const uint8_t *packet, uint32_t dest_ip, uint16_t dest_port)
       {
@@ -81,7 +81,9 @@ namespace lucp
         while (m_count > 0)
         {
           const auto &echo = m_queue[m_head];
-          transport.send(echo.header, HEADER_SIZE, echo.dest_ip, echo.dest_port);
+          int rc = transport.send(echo.header, HEADER_SIZE, echo.dest_ip, echo.dest_port);
+          if (rc < 0)
+            transport.log_error(rc, echo.dest_ip, echo.dest_port);
           m_head = (m_head + 1) % EchoQueueDepth;
           m_count--;
         }
@@ -157,6 +159,20 @@ namespace lucp
       }
 
       /**
+       * @brief Gets the next inactive pending-ACK entry.
+       * @return Pointer to the entry, or nullptr if no inactive entries.
+       */
+      PendingAck *get_next()
+      {
+        for (size_t i = 0; i < MaxPendingAcks; ++i)
+        {
+          if (!m_pending[i].active)
+            return &m_pending[i];
+        }
+        return nullptr;
+      }
+
+      /**
        * @brief Clears the first pending entry matching message identity and peer.
        * @param msg_id Message ID.
        * @param seq_id Sequence ID.
@@ -186,8 +202,7 @@ namespace lucp
        * @param registry Message registry indexed by msg_id.
        */
       template <size_t MsgCount>
-      void tick(ITransport &transport, uint32_t now_ms,
-                IMessage *const (&registry)[MsgCount])
+      void tick(ITransport &transport, uint32_t now_ms, IMessage *const (&registry)[MsgCount])
       {
         for (size_t i = 0; i < MaxPendingAcks; ++i)
         {
@@ -195,28 +210,26 @@ namespace lucp
           if (!pend.active)
             continue;
 
+          // Get the registered message for retry parameters
           IMessage *msg = registry[pend.msg_id];
-          if (!msg)
-          {
-            pend.active = false;
-            continue;
-          }
 
-          // Handle unsigned 32-bit timestamp wraparound safely
+          // Check if it's time to retry
           if ((now_ms - pend.last_tx_ms) >= msg->retry_delay_ms())
           {
+            // Check if we have retries left
             if (pend.retries_remaining > 0)
             {
               pend.retries_remaining--;
               pend.last_tx_ms = now_ms;
-              transport.send(pend.packet, pend.packet_len, pend.dest_ip,
-                             pend.dest_port);
+              transport.send(pend.packet, pend.packet_len, pend.dest_ip, pend.dest_port);
             }
             else
             {
               // Exhausted all transmission attempts
               pend.active = false;
-              msg->on_fail();
+              int rc = msg->on_fail();
+              if (rc < 0)
+                transport.log_error(rc, pend.dest_ip, pend.dest_port);
             }
           }
         }
@@ -238,8 +251,14 @@ namespace lucp
   class Node : public INode
   {
   public:
+    static_assert(MsgCount > 1, "MsgCount must be greater than 1 to allow registration of messages (ID 0 is reserved).");
     static_assert(MsgCount <= 256, "MsgCount cannot exceed 256 because msg_id is uint8_t.");
+    static_assert(MaxPendingAcks > 0, "MaxPendingAcks must be greater than 0 to allow tracking of messages.");
     static_assert(MaxPendingAcks < 256, "MaxPendingAcks must be < 256 to avoid seq_id aliasing.");
+    static_assert(MaxPayloadSize > 0, "MaxPayloadSize must be greater than 0 to allow messages with payloads.");
+    static_assert(MaxPayloadSize <= 1024, "MaxPayloadSize must be reasonably bounded to avoid stack overflow in send_raw and receive_incoming.");
+    static_assert(MaxRecvBurst > 0, "MaxRecvBurst must be greater than 0 to allow processing of incoming packets.");
+    static_assert(EchoQueueDepth > 0, "EchoQueueDepth must be greater than 0 to allow ACK echoes.");
 
     explicit Node(ITransport &transport) : m_transport(transport) { reset(); }
 
@@ -258,23 +277,48 @@ namespace lucp
     }
 
     /**
+     * @brief Resets only sequence counters, ACK tracking, and echo queue, preserving the message registry.
+     */
+    void reset_state()
+    {
+      for (size_t i = 0; i < MsgCount; ++i)
+      {
+        m_seq_id[i] = 0;
+      }
+      m_ack_manager.reset();
+      m_echo_queue.reset();
+    }
+
+    /**
      * @brief Register a strong-typed message object.
      */
     int register_message(IMessage *msg)
     {
+      // Reject null pointers
       if (!msg)
         return ERR_BAD_ARG;
+
+      // Validate msg_id is within range (0 is reserved)
       uint8_t msg_id = msg->id();
       if (msg_id == 0 || msg_id >= MsgCount)
         return ERR_INVALID_ID;
-      if (msg->size() == 0 || msg->size() > MaxPayloadSize)
-        return ERR_BAD_ARG;
 
+      // Validate msg_size is within bounds
+      uint16_t msg_size = msg->size();
+      if (msg_size == 0 || msg_size > MaxPayloadSize)
+        return ERR_INVALID_SIZE;
+
+      // Register the message
       msg->set_node(this);
       m_registry[msg_id] = msg;
       return OK;
     }
 
+    /**
+     * @brief Get a registered message by its ID.
+     * @param msg_id The message ID to retrieve.
+     * @return Pointer to the registered message, or nullptr if not found.
+     */
     IMessage *get_registered_message(uint8_t msg_id) const
     {
       // Validate msg_id is within valid range (0 is reserved)
@@ -299,36 +343,37 @@ namespace lucp
     int send_raw(uint8_t msg_id, const uint8_t *payload, uint16_t payload_size,
                  uint32_t dest_ip, uint16_t dest_port) override
     {
+      // Reject null payload
+      if (payload == nullptr)
+        return ERR_BAD_ARG;
+
       // Get registered message instance for this ID
       IMessage *msg = get_registered_message(msg_id);
       if (!msg)
         return ERR_INVALID_ID;
 
       const uint16_t expected_size = msg->size();
-      const bool requires_ack = msg->ack_required();
-      const uint16_t packet_len = static_cast<uint16_t>(HEADER_SIZE + expected_size);
 
       // Validate payload size against registered size
       if (payload_size != expected_size)
-        return ERR_BAD_ARG;
+        return ERR_INVALID_SIZE;
 
-      // Reserve an ACK slot up front for reliable messages.
-      int pending_idx = -1;
+      const bool requires_ack = msg->ack_required();
+      const uint16_t packet_len = static_cast<uint16_t>(HEADER_SIZE + expected_size);
+
+      // Reserve an ACK slot if required
       typename internal::AckManager<MaxPendingAcks, MaxPayloadSize>::PendingAck *pend = nullptr;
       if (requires_ack)
       {
-        pending_idx = m_ack_manager.allocate();
-        if (pending_idx < 0)
-          return ERR_QUEUE_FULL;
-        pend = m_ack_manager.get(pending_idx);
+        pend = m_ack_manager.get_next();
         if (!pend)
-          return ERR_BAD_ARG;
+          return ERR_QUEUE_FULL;
       }
 
       // Assign the next rolling sequence ID (wraps at 256)
-      uint8_t seq_id = m_seq_id[msg_id]++;
+      uint8_t seq_id = m_seq_id[msg_id] + 1;
 
-      // Build the packet directly on the runtime stack
+      // Build the packet
       uint8_t packet[HEADER_SIZE + MaxPayloadSize];
       packet[0] = MAGIC_0;
       packet[1] = MAGIC_1;
@@ -336,12 +381,7 @@ namespace lucp
       packet[3] = seq_id;
 
       // Copy payload after the 4 byte header
-      if (expected_size > 0)
-      {
-        if (payload == nullptr)
-          return ERR_BAD_ARG;
-        std::memcpy(packet + HEADER_SIZE, payload, expected_size);
-      }
+      std::memcpy(packet + HEADER_SIZE, payload, expected_size);
 
       // Send packet via transport PAL
       int rc = m_transport.send(packet, packet_len, dest_ip, dest_port);
@@ -349,6 +389,9 @@ namespace lucp
         return rc;
       if (rc != static_cast<int>(packet_len))
         return ERR_PAL_SEND;
+
+      // If send succeeds, increment sequence ID
+      m_seq_id[msg_id]++;
 
       // If send succeeds, add to ACK tracking if required
       if (requires_ack)
@@ -369,8 +412,7 @@ namespace lucp
 
     /**
      * @brief Validates and dispatches a single received packet.
-     * @note Node is not thread-safe. Calls that mutate state must be externally
-     * synchronized when used from multiple contexts.
+     * @note Node is not thread-safe. It should only be called from a single thread.
      *
      * Header-only packets are treated as ACK confirmations for reliable
      * messages. Payload packets are dispatched to the registered message

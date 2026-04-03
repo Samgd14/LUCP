@@ -216,7 +216,6 @@ virtual int receive(uint8_t* buf, uint16_t max_len, uint32_t& src_ip, uint16_t& 
 Optional diagnostics hooks:
 
 ```cpp
-virtual void log_debug(const char* fmt, ...);
 virtual void log_error(int error_code, uint32_t src_ip, uint16_t src_port);
 ```
 

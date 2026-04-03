@@ -45,10 +45,10 @@ void test_registration()
 
   // Redundant ID / zero sized / out-of-range should fail
   LargeMessage lm;
-  ASSERT_EQ(node.register_message(&lm), ERR_BAD_ARG);
+  ASSERT_EQ(node.register_message(&lm), ERR_INVALID_SIZE);
 
   ZeroSizedMessage zm;
-  ASSERT_EQ(node.register_message(&zm), ERR_BAD_ARG);
+  ASSERT_EQ(node.register_message(&zm), ERR_INVALID_SIZE);
 
   SimpleMessage sm_id0;
   // mock an ID of 0

@@ -18,5 +18,6 @@ namespace lucp
   constexpr int ERR_NOT_IMPLEMENTED = -5;
   constexpr int ERR_INVALID_PACKET = -6;
   constexpr int ERR_PACKET_TOO_LARGE = -7;
+  constexpr int ERR_INVALID_SIZE = -8;
 
 } // namespace lucp

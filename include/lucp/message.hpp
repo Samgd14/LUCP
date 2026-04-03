@@ -55,8 +55,7 @@ namespace lucp
     /**
      * @brief Called when a valid packet is completely received.
      * @return OK (0) on success, or an error code.
-     *         Returning ERR_NOT_IMPLEMENTED prevents the node from sending an
-     * ACK.
+     *         Returning an error prevents the node from sending an ACK.
      */
     virtual int handle(const uint8_t *payload, uint16_t size)
     {
@@ -68,19 +67,6 @@ namespace lucp
      * @return OK (0) on success, or an error code.
      */
     virtual int on_fail() { return ERR_NOT_IMPLEMENTED; }
-
-    // -------------------------------------------------------------
-    // Sender Interface
-    // -------------------------------------------------------------
-    /**
-     * @brief Sends this message's payload using the Node it is registered to.
-     */
-    int send_raw(const uint8_t *payload, uint32_t dest_ip, uint16_t dest_port)
-    {
-      if (!m_node)
-        return ERR_BAD_ARG; // Not registered to any node
-      return m_node->send_raw(id(), payload, size(), dest_ip, dest_port);
-    }
   };
 
   /**
@@ -101,8 +87,9 @@ namespace lucp
      */
     int send(const TPayload &payload, uint32_t dest_ip, uint16_t dest_port)
     {
-      return send_raw(reinterpret_cast<const uint8_t *>(&payload), dest_ip,
-                      dest_port);
+      if (!m_node)
+        return ERR_BAD_ARG; // Not registered to any node
+      return m_node->send_raw(id(), reinterpret_cast<const uint8_t *>(&payload), size(), dest_ip, dest_port);
     }
   };
 
