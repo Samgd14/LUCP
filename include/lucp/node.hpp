@@ -181,9 +181,6 @@ namespace lucp
       template <size_t MsgCount>
       void tick(ITransport &transport, uint32_t now_ms, IMessage *const (&registry)[MsgCount])
       {
-        uint32_t current_ip = 0;
-        uint16_t current_port = 0;
-
         for (size_t i = 0; i < MaxPendingAcks; ++i)
         {
           auto &pend = m_pending[i];
@@ -193,25 +190,32 @@ namespace lucp
           // Get the registered message for retry parameters
           IMessage *msg = registry[pend.msg_id];
 
-          // Check if it's time to retry
           if ((now_ms - pend.last_tx_ms) >= msg->retry_delay_ms())
           {
-            // Check if we have retries left
             if (pend.retries_remaining > 0)
             {
-              pend.retries_remaining--;
-              pend.last_tx_ms = now_ms;
-              transport.send(pend.packet, pend.packet_len, pend.dest_ip, pend.dest_port);
+              int rc = transport.send(pend.packet, pend.packet_len,
+                                      pend.dest_ip, pend.dest_port);
+              if (rc < 0 || rc != static_cast<int>(pend.packet_len))
+              {
+                // Retry send failed: log and leave retries_remaining intact so
+                // we try again next tick instead of consuming the retry.
+                transport.log_error(rc < 0 ? rc : ERR_PAL_SEND,
+                                    pend.dest_ip, pend.dest_port);
+              }
+              else
+              {
+                pend.retries_remaining--;
+                pend.last_tx_ms = now_ms;
+              }
             }
             else
             {
               // Exhausted all transmission attempts
-              current_ip = pend.dest_ip;
-              current_port = pend.dest_port;
               pend.active = false;
               int rc = msg->on_fail();
               if (rc < 0)
-                transport.log_error(rc, current_ip, current_port);
+                transport.log_error(rc, pend.dest_ip, pend.dest_port);
             }
           }
         }

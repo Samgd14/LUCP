@@ -203,6 +203,33 @@ void test_spurious_ack_returns_no_pending()
   ASSERT_EQ(node.process_packet(realAck, HEADER_SIZE, 0xC0A80401, 9000), OK);
 }
 
+void test_retry_send_failure_not_consumed()
+{
+  MockTransport trans;
+  Node<> node(trans);
+  ReliableMessage msg; // max_retries 2, retry_delay 100
+  node.register_message(&msg);
+
+  uint8_t payload[4] = {1, 2, 3, 4};
+  ASSERT_EQ(msg.send(payload, 0, 0), OK);
+  ASSERT_EQ(trans.sent_packets.size(), 1); // initial send succeeded
+
+  // Make the transport fail for the upcoming retry.
+  trans.send_result = -3; // ERR_PAL_SEND
+  trans.m_time += 150;
+  node.ack_tick();
+
+  // Retry send failed: NOT added to sent_packets, and logged.
+  ASSERT_EQ(trans.sent_packets.size(), 1);
+  ASSERT_TRUE(trans.lucp_error_count > 0);
+
+  // Retry was NOT consumed: restore transport and tick again -> retry now fires.
+  trans.send_result = 0;
+  trans.m_time += 150;
+  node.ack_tick();
+  ASSERT_EQ(trans.sent_packets.size(), 2);
+}
+
 int main()
 {
   test_ack_workflow();
@@ -211,6 +238,7 @@ int main()
   test_default_on_fail_returns_missing();
   test_positive_handle_still_acks();
   test_spurious_ack_returns_no_pending();
+  test_retry_send_failure_not_consumed();
   std::cout << "test_ack_echo PASSED\n";
   return 0;
 }
