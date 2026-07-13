@@ -21,5 +21,9 @@ namespace lucp
   constexpr int ERR_INVALID_SIZE = -8;
   constexpr int ERR_ALREADY_REGISTERED = -9;
   constexpr int ERR_CANNOT_ECHO = -10;
+  constexpr int ERR_HANDLE_MISSING = -11;    // handle() not overridden (default returned)
+  constexpr int ERR_ON_FAIL_MISSING = -12;   // on_fail() not overridden (default returned)
+  constexpr int ERR_NO_PENDING = -13;        // ACK had no matching pending record (spurious)
+  constexpr int ERR_NOT_REGISTERED = -14;     // TypedMessage::send called before registration
 
 } // namespace lucp

@@ -109,11 +109,26 @@ void test_receive_incoming_logs_errors()
   ASSERT_EQ(sm10.handled_count, 1);
 }
 
+void test_error_codes_distinct()
+{
+  ASSERT_TRUE(ERR_HANDLE_MISSING < 0);
+  ASSERT_TRUE(ERR_ON_FAIL_MISSING < 0);
+  ASSERT_TRUE(ERR_NO_PENDING < 0);
+  ASSERT_TRUE(ERR_NOT_REGISTERED < 0);
+  ASSERT_TRUE(ERR_HANDLE_MISSING != ERR_ON_FAIL_MISSING);
+  ASSERT_TRUE(ERR_HANDLE_MISSING != ERR_NO_PENDING);
+  ASSERT_TRUE(ERR_HANDLE_MISSING != ERR_NOT_REGISTERED);
+  ASSERT_TRUE(ERR_ON_FAIL_MISSING != ERR_NO_PENDING);
+  ASSERT_TRUE(ERR_ON_FAIL_MISSING != ERR_NOT_REGISTERED);
+  ASSERT_TRUE(ERR_NO_PENDING != ERR_NOT_REGISTERED);
+}
+
 int main()
 {
   test_registration();
   test_validation();
   test_receive_incoming_logs_errors();
+  test_error_codes_distinct();
   std::cout << "test_core PASSED\n";
   return 0;
 }
