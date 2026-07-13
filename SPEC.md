@@ -1,4 +1,4 @@
-# Lightweight UDP Control Protocol (LUCP) - Specification v0.2
+# Lightweight UDP Command Protocol (LUCP) - Specification v0.2
 
 ---
 
