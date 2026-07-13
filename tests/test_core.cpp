@@ -50,7 +50,6 @@ void test_registration()
   ZeroSizedMessage zm;
   ASSERT_EQ(node.register_message(&zm), ERR_INVALID_SIZE);
 
-  SimpleMessage sm_id0;
   // mock an ID of 0
   class BadMSG : public SimpleMessage
   {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <iostream>
+#include <cstdlib>
 
 #define ASSERT_TRUE(condition)                                                                                 \
   do                                                                                                           \
@@ -72,12 +73,13 @@ public:
     incoming_packets.erase(incoming_packets.begin());
 
     // Fail loudly if a queued test packet exceeds the node's buffer.
-    // This catches misconfigured tests rather than silently truncating data.
+    // A misconfigured test should abort, not silently stall the drain.
     if (packet.data.size() > max_len)
     {
       std::cerr << "MockTransport::receive: packet size " << packet.data.size()
-                << " exceeds buffer size " << max_len << "\n";
-      return -1;
+                << " exceeds buffer size " << max_len
+                << " — aborting test (misconfigured packet).\n";
+      std::exit(1);
     }
 
     std::memcpy(buf, packet.data.data(), packet.data.size());
