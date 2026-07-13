@@ -240,9 +240,9 @@ namespace lucp
     static_assert(MsgCount > 1, "MsgCount must be greater than 1 to allow registration of messages (ID 0 is reserved).");
     static_assert(MsgCount <= 256, "MsgCount cannot exceed 256 because msg_id is uint8_t.");
     static_assert(MaxPendingAcks > 0, "MaxPendingAcks must be greater than 0 to allow tracking of messages.");
-    static_assert(MaxPendingAcks < 256, "MaxPendingAcks cannot exceed 256 because msg_id is uint8_t.");
+    static_assert(MaxPendingAcks < 256, "MaxPendingAcks cannot exceed 255 because seq_id is uint8_t and each in-flight entry needs a distinct seq slot.");
     static_assert(MaxPayloadSize > 0, "MaxPayloadSize must be greater than 0 to allow messages with payloads.");
-    static_assert(MaxPayloadSize <= 1024, "MaxPayloadSize must be reasonably bounded to avoid stack overflow in send_raw and receive_incoming.");
+    static_assert(MaxPayloadSize <= 508, "MaxPayloadSize must be <= 508 so a full packet (HEADER_SIZE + payload) fits within 512 bytes and avoids UDP fragmentation.");
     static_assert(MaxRecvBurst > 0, "MaxRecvBurst must be greater than 0 to allow processing of incoming packets.");
     static_assert(EchoQueueDepth > 0, "EchoQueueDepth must be greater than 0 to allow ACK echoes.");
 
