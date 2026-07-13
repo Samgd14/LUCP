@@ -159,12 +159,39 @@ void test_default_on_fail_returns_missing()
   ASSERT_EQ(trans.last_lucp_error, ERR_ON_FAIL_MISSING);
 }
 
+// handle() returns a POSITIVE value; ACK must still be echoed (B8).
+class PositiveHandleMessage : public TypedMessage<uint8_t[4]>
+{
+public:
+  uint8_t id() const override { return 102; }
+  bool ack_required() const override { return true; }
+  int handle(const uint8_t *, uint16_t) override { return 7; } // positive, non-OK
+};
+
+void test_positive_handle_still_acks()
+{
+  MockTransport trans;
+  Node<> node(trans);
+  PositiveHandleMessage msg;
+  node.register_message(&msg);
+
+  uint8_t rx[HEADER_SIZE + 4] = {MAGIC_0, MAGIC_1, 102, 9, 0, 0, 0, 0};
+  ASSERT_EQ(node.process_packet(rx, sizeof(rx), 0xC0A80301, 1000), OK);
+
+  // Echo must have been queued and is dispatched on flush.
+  node.flush_echo_queue();
+  ASSERT_EQ(trans.sent_packets.size(), 1);
+  ASSERT_EQ(trans.sent_packets[0].data.size(), HEADER_SIZE);
+  ASSERT_EQ(trans.sent_packets[0].data[3], 9);
+}
+
 int main()
 {
   test_ack_workflow();
   test_ack_exhaustion();
   test_echo_response();
   test_default_on_fail_returns_missing();
+  test_positive_handle_still_acks();
   std::cout << "test_ack_echo PASSED\n";
   return 0;
 }

@@ -469,14 +469,17 @@ namespace lucp
         return ERR_QUEUE_FULL;
       }
 
-      // Dispatch payload to the correct handler
+      // Dispatch payload to the correct handler.
+      // Convention: rc < 0 = error (no ACK, propagate); rc >= 0 = success.
       int rc = msg->handle(packet + HEADER_SIZE, payload_size);
-      if (rc != OK)
+      if (rc < 0)
         return rc;
 
-      // Enqueue an ACK echo if required
+      // Enqueue an ACK echo if required; normalize a non-negative handle rc to OK.
       if (requires_ack)
         rc = m_echo_queue.enqueue(packet, source_ip, source_port);
+      else
+        rc = OK;
 
       return rc;
     }
