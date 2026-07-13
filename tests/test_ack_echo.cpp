@@ -185,6 +185,24 @@ void test_positive_handle_still_acks()
   ASSERT_EQ(trans.sent_packets[0].data[3], 9);
 }
 
+void test_spurious_ack_returns_no_pending()
+{
+  MockTransport trans;
+  Node<> node(trans);
+  ReliableMessage msg; // ack_required, id 100
+  node.register_message(&msg);
+
+  // ACK for a seq/peer with NO pending record.
+  uint8_t ack[HEADER_SIZE] = {MAGIC_0, MAGIC_1, 100, 77};
+  ASSERT_EQ(node.process_packet(ack, HEADER_SIZE, 0xC0A80401, 9000), ERR_NO_PENDING);
+
+  // Now a real send + matching ACK returns OK.
+  uint8_t payload[4] = {1, 2, 3, 4};
+  ASSERT_EQ(msg.send(payload, 0xC0A80401, 9000), OK);
+  uint8_t realAck[HEADER_SIZE] = {MAGIC_0, MAGIC_1, 100, trans.sent_packets[0].data[3]};
+  ASSERT_EQ(node.process_packet(realAck, HEADER_SIZE, 0xC0A80401, 9000), OK);
+}
+
 int main()
 {
   test_ack_workflow();
@@ -192,6 +210,7 @@ int main()
   test_echo_response();
   test_default_on_fail_returns_missing();
   test_positive_handle_still_acks();
+  test_spurious_ack_returns_no_pending();
   std::cout << "test_ack_echo PASSED\n";
   return 0;
 }

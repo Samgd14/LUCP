@@ -153,12 +153,9 @@ namespace lucp
 
       /**
        * @brief Clears the first pending entry matching message identity and peer.
-       * @param msg_id Message ID.
-       * @param seq_id Sequence ID.
-       * @param dest_ip Destination IP tracked for the pending packet.
-       * @param dest_port Destination port tracked for the pending packet.
+       * @return true if a matching entry was found and cleared, false otherwise.
        */
-      void clear(uint8_t msg_id, uint8_t seq_id, uint32_t dest_ip,
+      bool clear(uint8_t msg_id, uint8_t seq_id, uint32_t dest_ip,
                  uint16_t dest_port)
       {
         for (size_t i = 0; i < MaxPendingAcks; ++i)
@@ -168,9 +165,10 @@ namespace lucp
               pend.dest_ip == dest_ip && pend.dest_port == dest_port)
           {
             pend.active = false;
-            break;
+            return true;
           }
         }
+        return false;
       }
 
       /**
@@ -452,8 +450,9 @@ namespace lucp
         {
           return ERR_INVALID_PACKET;
         }
-        m_ack_manager.clear(msg_id, seq_id, source_ip, source_port);
-        return OK;
+        const bool matched =
+            m_ack_manager.clear(msg_id, seq_id, source_ip, source_port);
+        return matched ? OK : ERR_NO_PENDING;
       }
 
       // Validate payload size
