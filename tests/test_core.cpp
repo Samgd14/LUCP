@@ -143,6 +143,110 @@ void test_error_codes_distinct()
   ASSERT_TRUE(ERR_NO_PENDING != ERR_NOT_REGISTERED);
 }
 
+void test_error_code_paths()
+{
+  MockTransport trans;
+  Node<256, 16, 4, 128> node(trans);
+
+  // ERR_ALREADY_REGISTERED
+  SimpleMessage a;
+  ASSERT_EQ(node.register_message(&a), OK);
+  SimpleMessage b; // same id (10)
+  ASSERT_EQ(node.register_message(&b), ERR_ALREADY_REGISTERED);
+
+  // ERR_BAD_ARG: null packet, undersize
+  ASSERT_EQ(node.process_packet(nullptr, 8, 0, 0), ERR_BAD_ARG);
+  uint8_t tiny[] = {MAGIC_0, MAGIC_1, 10};
+  ASSERT_EQ(node.process_packet(tiny, 3, 0, 0), ERR_BAD_ARG); // size < HEADER_SIZE
+
+  // ERR_PACKET_TOO_LARGE
+  uint8_t too_big[HEADER_SIZE + 129] = {MAGIC_0, MAGIC_1, 10, 0};
+  ASSERT_EQ(node.process_packet(too_big, sizeof(too_big), 0, 0), ERR_PACKET_TOO_LARGE);
+}
+
+void test_queue_full_on_send()
+{
+  MockTransport trans;
+  Node<256, 16, 2, 128> node(trans); // MaxPendingAcks = 2
+  class RelMsg : public TypedMessage<uint8_t[4]>
+  {
+  public:
+    uint8_t id() const override { return 50; }
+    bool ack_required() const override { return true; }
+    uint8_t max_retries() const override { return 5; }
+    uint16_t retry_delay_ms() const override { return 1000; }
+  } m1, m2, m3;
+  node.register_message(&m1);
+  // Same id won't allow multiple registrations; use distinct ids.
+  class RelMsg2 : public RelMsg
+  {
+  public:
+    uint8_t id() const override { return 51; }
+  } m2b, m3b;
+  class RelMsg3 : public RelMsg
+  {
+  public:
+    uint8_t id() const override { return 52; }
+  } m4, m5;
+  node.register_message(&m2b);
+  node.register_message(&m4);
+  node.register_message(&m5);
+
+  uint8_t p[4] = {0, 0, 0, 0};
+  ASSERT_EQ(m1.send(p, 0, 0), OK);        // slot 1
+  ASSERT_EQ(m2b.send(p, 0, 0), OK);        // slot 2
+  ASSERT_EQ(m4.send(p, 0, 0), ERR_QUEUE_FULL); // no slots left
+}
+
+void test_reset_wipes_registry()
+{
+  MockTransport trans;
+  Node<256, 16, 4, 128> node(trans);
+  SimpleMessage sm;
+  ASSERT_EQ(node.register_message(&sm), OK);
+
+  node.reset(); // wipes registry
+
+  uint8_t good[] = {MAGIC_0, MAGIC_1, 10, 0, 0, 0, 0, 0};
+  ASSERT_EQ(node.process_packet(good, 8, 0, 0), ERR_INVALID_ID); // no longer registered
+}
+
+void test_reset_state_preserves_registry()
+{
+  MockTransport trans;
+  Node<256, 16, 4, 128> node(trans);
+  SimpleMessage sm;
+  ASSERT_EQ(node.register_message(&sm), OK);
+
+  uint8_t good[] = {MAGIC_0, MAGIC_1, 10, 0, 0, 0, 0, 0};
+  ASSERT_EQ(node.process_packet(good, 8, 0, 0), OK);
+  ASSERT_EQ(sm.handled_count, 1);
+
+  node.reset_state(); // preserves registry, clears state (incl. dedup)
+  ASSERT_EQ(node.process_packet(good, 8, 0, 0), OK); // still registered, treated as new
+  ASSERT_EQ(sm.handled_count, 2);
+}
+
+void test_max_recv_burst_cap()
+{
+  MockTransport trans;
+  Node<256, 16, 4, 128> node(trans); // default MaxRecvBurst = 64
+  SimpleMessage sm;
+  node.register_message(&sm);
+
+  uint8_t good[] = {MAGIC_0, MAGIC_1, 10, 0, 0, 0, 0, 0};
+  for (int i = 0; i < 70; ++i)
+    trans.queue_packet(good, 8, 0, 0);
+
+  node.receive_incoming();
+  // Only first 64 processed in this call (dedup also drops duplicate seqs:
+  // all have seq 0, so only the first is handled).
+  ASSERT_EQ(sm.handled_count, 1);
+  // Remaining packets still queued; a second call drains more (still dedup'd).
+  node.receive_incoming();
+  ASSERT_EQ(sm.handled_count, 1); // still seq 0 -> dedup'd
+}
+
 int main()
 {
   test_registration();
@@ -150,6 +254,11 @@ int main()
   test_receive_incoming_logs_errors();
   test_error_codes_distinct();
   test_default_handle_returns_missing();
+  test_error_code_paths();
+  test_queue_full_on_send();
+  test_reset_wipes_registry();
+  test_reset_state_preserves_registry();
+  test_max_recv_burst_cap();
   std::cout << "test_core PASSED\n";
   return 0;
 }

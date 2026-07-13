@@ -90,10 +90,37 @@ void test_typed_send_not_registered() {
     ASSERT_EQ(trans.sent_packets.size(), 0);
 }
 
+void test_wire_format_byte_offsets()
+{
+  MockTransport trans;
+  Node<> node(trans);
+  IntMessage imsg;
+  node.register_message(&imsg);
+
+  TestPayload tx = {7, 1.5f};
+  ASSERT_EQ(imsg.send(tx, 0x01020304, 5678), OK);
+  ASSERT_EQ(trans.sent_packets.size(), 1);
+
+  const auto &d = trans.sent_packets[0].data;
+  ASSERT_EQ(d.size(), HEADER_SIZE + sizeof(TestPayload));
+  ASSERT_EQ(d[0], MAGIC_0);
+  ASSERT_EQ(d[1], MAGIC_1);
+  ASSERT_EQ(d[2], 5);     // msg_id at byte 2
+  ASSERT_EQ(d[3], 0);     // seq_id at byte 3 (first send)
+  ASSERT_EQ(trans.sent_packets[0].ip, 0x01020304);
+  ASSERT_EQ(trans.sent_packets[0].port, 5678);
+
+  TestPayload rx;
+  std::memcpy(&rx, d.data() + HEADER_SIZE, sizeof(TestPayload));
+  ASSERT_EQ(rx.a, 7);
+  ASSERT_EQ(rx.b, 1.5f);
+}
+
 int main() {
     test_typed_send();
     test_handle_called_with_oop_instance();
     test_typed_send_not_registered();
+    test_wire_format_byte_offsets();
     std::cout << "test_message PASSED\n";
     return 0;
 }

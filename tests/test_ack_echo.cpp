@@ -321,6 +321,62 @@ void test_reset_state_clears_dedup()
   ASSERT_EQ(msg.handled_count, 2);
 }
 
+class EchoTargetMessage : public TypedMessage<uint8_t[4]>
+{
+public:
+  uint8_t id() const override { return 104; }
+  bool ack_required() const override { return true; }
+  int handle(const uint8_t *, uint16_t) override { handled_count++; return OK; }
+  int handled_count = 0;
+};
+
+void test_echo_queue_full_drops_before_handle()
+{
+  MockTransport trans;
+  Node<256, 2, 4, 256> node(trans); // EchoQueueDepth = 2
+  EchoTargetMessage msg;
+  node.register_message(&msg);
+
+  uint8_t rx[HEADER_SIZE + 4] = {MAGIC_0, MAGIC_1, 104, 0, 1, 2, 3, 4};
+  ASSERT_EQ(node.process_packet(rx, sizeof(rx), 0, 0), OK);        // echo 1
+  ASSERT_EQ(node.process_packet(rx, sizeof(rx), 0, 0), OK);        // echo 2 (dup, not re-handled)
+  ASSERT_EQ(msg.handled_count, 1);
+
+  // Use a NEW seq so it's not dedup'd, but echo queue is now full (2 entries).
+  uint8_t rx2[HEADER_SIZE + 4] = {MAGIC_0, MAGIC_1, 104, 1, 1, 2, 3, 4};
+  ASSERT_EQ(node.process_packet(rx2, sizeof(rx2), 0, 0), ERR_QUEUE_FULL);
+  ASSERT_EQ(msg.handled_count, 1); // handle() NOT called (dropped before handle)
+}
+
+void test_ack_wrong_peer_does_not_clear()
+{
+  MockTransport trans;
+  Node<> node(trans);
+  ReliableMessage msg;
+  node.register_message(&msg);
+
+  uint8_t payload[4] = {1, 2, 3, 4};
+  ASSERT_EQ(msg.send(payload, 0xC0A80601, 9000), OK);
+  uint8_t seq = trans.sent_packets[0].data[3];
+
+  // ACK from the WRONG peer -> no match -> ERR_NO_PENDING, pending stays.
+  uint8_t ackWrong[HEADER_SIZE] = {MAGIC_0, MAGIC_1, 100, seq};
+  ASSERT_EQ(node.process_packet(ackWrong, HEADER_SIZE, 0xC0A80699, 9999), ERR_NO_PENDING);
+
+  // A retry should still fire (pending not cleared).
+  trans.m_time += 150;
+  node.ack_tick();
+  ASSERT_EQ(trans.sent_packets.size(), 2);
+
+  // ACK from the RIGHT peer -> clears -> OK.
+  uint8_t ackRight[HEADER_SIZE] = {MAGIC_0, MAGIC_1, 100, seq};
+  ASSERT_EQ(node.process_packet(ackRight, HEADER_SIZE, 0xC0A80601, 9000), OK);
+
+  trans.m_time += 150;
+  node.ack_tick();
+  ASSERT_EQ(trans.sent_packets.size(), 2); // no further retry
+}
+
 int main()
 {
   test_ack_workflow();
@@ -334,6 +390,8 @@ int main()
   test_out_of_order_older_dropped_newer_handled();
   test_wrap_around_new_packet_handled();
   test_reset_state_clears_dedup();
+  test_echo_queue_full_drops_before_handle();
+  test_ack_wrong_peer_does_not_clear();
   std::cout << "test_ack_echo PASSED\n";
   return 0;
 }
