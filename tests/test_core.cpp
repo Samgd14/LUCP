@@ -109,6 +109,27 @@ void test_receive_incoming_logs_errors()
   ASSERT_EQ(sm10.handled_count, 1);
 }
 
+// A message that does NOT override handle() (inherits the default).
+class NoHandleMessage : public IMessage
+{
+public:
+  uint8_t id() const override { return 11; }
+  uint16_t size() const override { return 4; }
+  bool ack_required() const override { return true; }
+};
+
+void test_default_handle_returns_missing()
+{
+  MockTransport trans;
+  Node<256, 16, 4, 128> node(trans);
+  NoHandleMessage nh;
+  ASSERT_EQ(node.register_message(&nh), OK);
+
+  uint8_t pkt[] = {MAGIC_0, MAGIC_1, 11, 0, 0, 0, 0, 0};
+  ASSERT_EQ(node.process_packet(pkt, 8, 0, 0), ERR_HANDLE_MISSING);
+  ASSERT_EQ(trans.sent_packets.size(), 0); // No echo queued/dispatched
+}
+
 void test_error_codes_distinct()
 {
   ASSERT_TRUE(ERR_HANDLE_MISSING < 0);
@@ -129,6 +150,7 @@ int main()
   test_validation();
   test_receive_incoming_logs_errors();
   test_error_codes_distinct();
+  test_default_handle_returns_missing();
   std::cout << "test_core PASSED\n";
   return 0;
 }

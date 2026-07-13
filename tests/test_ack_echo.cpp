@@ -124,11 +124,47 @@ void test_echo_response()
   ASSERT_EQ(trans.sent_packets[0].data[3], 42);              // Sequence mirrored
 }
 
+// A reliable message that does NOT override on_fail() (inherits the default).
+class NoOnFailMessage : public TypedMessage<uint8_t[4]>
+{
+public:
+  uint8_t id() const override { return 101; }
+  bool ack_required() const override { return true; }
+  uint8_t max_retries() const override { return 1; }
+  uint16_t retry_delay_ms() const override { return 100; }
+  int handle(const uint8_t *, uint16_t) override { return OK; }
+};
+
+void test_default_on_fail_returns_missing()
+{
+  MockTransport trans;
+  Node<> node(trans);
+  NoOnFailMessage msg;
+  node.register_message(&msg);
+
+  uint8_t payload[4] = {1, 2, 3, 4};
+  ASSERT_EQ(msg.send(payload, 0, 0), OK);
+  ASSERT_EQ(trans.sent_packets.size(), 1);
+
+  // T1: 1st retry
+  trans.m_time += 150;
+  node.ack_tick();
+  ASSERT_EQ(trans.sent_packets.size(), 2);
+
+  // T2: exhausted -> on_fail() default returns ERR_ON_FAIL_MISSING, logged
+  trans.m_time += 150;
+  node.ack_tick();
+  ASSERT_EQ(trans.sent_packets.size(), 2);
+  ASSERT_TRUE(trans.lucp_error_count > 0);
+  ASSERT_EQ(trans.last_lucp_error, ERR_ON_FAIL_MISSING);
+}
+
 int main()
 {
   test_ack_workflow();
   test_ack_exhaustion();
   test_echo_response();
+  test_default_on_fail_returns_missing();
   std::cout << "test_ack_echo PASSED\n";
   return 0;
 }

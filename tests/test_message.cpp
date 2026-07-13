@@ -74,9 +74,26 @@ void test_handle_called_with_oop_instance() {
     ASSERT_EQ(imsg.last_payload.b, -5.0f);
 }
 
+class UnregisteredTyped : public TypedMessage<uint32_t>
+{
+public:
+  uint8_t id() const override { return 7; }
+  bool ack_required() const override { return false; }
+};
+
+void test_typed_send_not_registered() {
+    MockTransport trans;
+    Node<> node(trans);
+    UnregisteredTyped msg; // NOT registered
+    uint32_t v = 1;
+    ASSERT_EQ(msg.send(v, 0, 0), ERR_NOT_REGISTERED);
+    ASSERT_EQ(trans.sent_packets.size(), 0);
+}
+
 int main() {
     test_typed_send();
     test_handle_called_with_oop_instance();
+    test_typed_send_not_registered();
     std::cout << "test_message PASSED\n";
     return 0;
 }

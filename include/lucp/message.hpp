@@ -59,14 +59,16 @@ namespace lucp
      */
     virtual int handle(const uint8_t *payload, uint16_t size)
     {
-      return ERR_NOT_IMPLEMENTED;
+      (void)payload;
+      (void)size;
+      return ERR_HANDLE_MISSING;
     }
 
     /**
      * @brief Called when a transmitted, ack-required packet exhausts all retries.
      * @return OK (0) on success, or an error code.
      */
-    virtual int on_fail() { return ERR_NOT_IMPLEMENTED; }
+    virtual int on_fail() { return ERR_ON_FAIL_MISSING; }
   };
 
   /**
@@ -84,11 +86,14 @@ namespace lucp
 
     /**
      * @brief Strongly-typed send wrapper for this specific payload struct.
+     * @note Forwards to INode::send_raw(); on Node this builds the packet on the
+     *       stack (HEADER_SIZE + MaxPayloadSize) — see Node::send_raw for the
+     *       stack-budget warning.
      */
     int send(const TPayload &payload, uint32_t dest_ip, uint16_t dest_port)
     {
       if (!m_node)
-        return ERR_BAD_ARG; // Not registered to any node
+        return ERR_NOT_REGISTERED; // Not registered to any node
       return m_node->send_raw(id(), reinterpret_cast<const uint8_t *>(&payload), size(), dest_ip, dest_port);
     }
   };
