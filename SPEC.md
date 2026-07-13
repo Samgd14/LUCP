@@ -81,15 +81,37 @@ Constants in code:
 - `magic`: fast protocol filter; packets with wrong magic bytes are dropped.
 - `msg_id`: message identifier (`uint8_t`). Value `0` is invalid in current implementation.
 - `seq_id`: rolling sequence byte assigned by sender per `msg_id`.
-- `payload`: exactly `IMessage::size()` bytes for that `msg_id`.
+- `payload`: exactly `IMessage::size()` bytes for that `msg_id`. Zero-length data messages are impossible by design: `size() == 0` is rejected at registration, and a header-only packet is reserved for ACKs.
 
 ### 4.3 Packet Types
 
 - Data packet: header + payload.
 - ACK packet: header only (`size == HEADER_SIZE`).
 
-### 4.4 Size Constraints
-The maximum payload size is defined by the `Node` template parameter `MaxPayloadSize`. The total packet size must fit within typical UDP limits (e.g., 512 bytes or less) to avoid fragmentation. It is recommended to minimize payload sizes for better performance and reliability on constrained networks and nodes.
+### 4.4 Error Codes
+
+All `Node` and message APIs return `int`: `OK` (0) on success, negative codes on error.
+
+| Code | Name | Meaning |
+|------|------|---------|
+| 0 | `OK` | Success |
+| -1 | `ERR_INVALID_ID` | msg_id is 0, out of range, or not registered |
+| -2 | `ERR_QUEUE_FULL` | ACK/pending or echo queue is full |
+| -3 | `ERR_PAL_SEND` | Transport send returned an unexpected byte count |
+| -4 | `ERR_BAD_ARG` | Null pointer or undersized packet argument |
+| -5 | `ERR_NOT_IMPLEMENTED` | (Reserved) operation not implemented |
+| -6 | `ERR_INVALID_PACKET` | Bad magic, wrong payload size, or ACK on a non-ack message |
+| -7 | `ERR_PACKET_TOO_LARGE` | Packet exceeds HEADER_SIZE + MaxPayloadSize |
+| -8 | `ERR_INVALID_SIZE` | Message size() is 0 or exceeds MaxPayloadSize at registration |
+| -9 | `ERR_ALREADY_REGISTERED` | A message is already registered for this msg_id |
+| -10 | `ERR_CANNOT_ECHO` | An echo ACK send failed during flush |
+| -11 | `ERR_HANDLE_MISSING` | handle() was not overridden (default returned) |
+| -12 | `ERR_ON_FAIL_MISSING` | on_fail() was not overridden (default returned) |
+| -13 | `ERR_NO_PENDING` | An ACK had no matching pending record (spurious/duplicate ACK) |
+| -14 | `ERR_NOT_REGISTERED` | TypedMessage::send called before registration |
+
+### 4.5 Size Constraints
+The maximum payload size is defined by the `Node` template parameter `MaxPayloadSize`. MaxPayloadSize is bounded to 508 (so a full packet is <= 512 bytes). Keep payloads well under this to minimize fragmentation and retransmission cost on constrained networks.
 
 ---
 
@@ -115,10 +137,11 @@ virtual uint16_t retry_delay_ms() const { return 0; }
 Receive and failure hooks (should be implemented per-platform):
 
 ```cpp
-virtual int handle(const uint8_t* payload, uint16_t size);
-virtual int on_fail();
-virtual int send_raw(const uint8_t* payload, uint16_t size, uint32_t dest_ip, uint16_t dest_port);
+virtual int handle(const uint8_t* payload, uint16_t size);  // default returns ERR_HANDLE_MISSING
+virtual int on_fail();                                       // default returns ERR_ON_FAIL_MISSING
 ```
+
+Sending is performed via `INode::send_raw(...)` (implemented by `Node`), not on `IMessage` directly. `TypedMessage<TPayload>` provides a typed `send()` wrapper that forwards to the node it was registered against.
 
 Important implementation rules:
 
@@ -137,11 +160,15 @@ The helper `TypedMessage<TPayload>` automatically implements `size()` as `sizeof
 
 When a registered message has `ack_required()` return `true`, `Node::send_raw(...)`:
 
-1. Assigns and increments the sequence byte for that message ID.
+1. Assigns the current sequence byte for that message ID and (on a successful send) increments it for the next send. A failed send does not consume a sequence number.
 2. Builds and sends the packet.
 3. Stores a pending ACK record in a bounded internal table.
 
 If the send call fails, the pending record for that packet is cleared.
+
+The sequence counter is per msg_id (global across all destinations), not per-peer. The ip:port fields in ACK matching prevent cross-peer confusion. If multiple peers send the same msg_id to one receiver, their seqs interleave and the per-msg_id dedup (§6.4.1) may drop a newer packet from one peer relative to another's last seen — acceptable for the typical host↔node topology (one peer per msg_id per direction).
+
+Sequence wraparound: `seq_id` is a rolling `uint8_t`. With the default `MaxPendingAcks=4`, an in-flight unacked send can never share a seq with a newer in-flight send, so ACK misattribution is unreachable. Configuring a large `MaxPendingAcks` (approaching 256) with high reliable throughput to a single peer can, after a 256-send wrap, let an ACK clear the wrong (older) pending entry. Keep `MaxPendingAcks` modest for your throughput.
 
 ### 6.2 ACK Matching
 
@@ -156,12 +183,20 @@ It clears a pending record only when all fields match:
 
 ACKs for non-ack-required messages return `ERR_INVALID_PACKET`.
 
+This requires the ACK echo to be sourced from the same IP:port the data was sent to. NAT or asymmetric routing that changes the source endpoint will break ACK matching silently.
+
+An ACK that matches no pending record (spurious or duplicate ACK) returns `ERR_NO_PENDING`; the pending table is unchanged.
+
 ### 6.3 Retry and Exhaustion
 
 `Node::tick()` drives retries using `ITransport::now_ms()` and each message's `retry_delay_ms()`.
 
 - While retries remain: packet is resent and `retries_remaining` is decremented.
 - When retries are exhausted: pending record is removed and `on_fail()` is called.
+
+Retry delay is fixed (`retry_delay_ms()`); there is no exponential backoff. This is intentional for predictable behavior on constrained nodes.
+
+If a retry's transport send fails, the retry is logged via `log_error` and `retries_remaining` is NOT decremented — the retry is attempted again on the next tick.
 
 ### 6.4 Echo ACK on Receive
 
@@ -174,6 +209,17 @@ For inbound data packets of ack-required messages:
 
 If the echo queue is full, the packet is dropped before `handle()` is called.
 
+### 6.4.1 Duplicate / Stale-Packet Suppression
+
+The receiver tracks, per msg_id, the last handled sequence byte. On an inbound data packet:
+
+- If the msg_id has been seen before and the incoming seq equals the last seen (a retransmit) or is behind it within a half-window (an out-of-order older packet), the packet is a **duplicate**: `handle()` is NOT called, but the ACK echo is still sent so the sender stops retrying.
+- Otherwise the packet is new: `handle()` is called and the last-seen seq is updated.
+
+Latest-takes-precedence: out-of-order older packets are dropped by design. This is the expected behavior for low-latency data streaming. Applications that cannot tolerate dropped older packets must avoid relying on out-of-order delivery.
+
+The half-window comparison is `((last_seen - seq) & 0xFF) <= 127` (behind/equal) vs `> 127` (ahead / wrapped-newer). Dedup state is keyed per msg_id and is reset by both `reset()` and `reset_state()`.
+
 ---
 
 ## 7. Node Dispatch Behavior
@@ -182,12 +228,16 @@ If the echo queue is full, the packet is dropped before `handle()` is called.
 
 1. Drop packet if null or shorter than header.
 2. Validate magic bytes.
-3. Validate `msg_id` (`1..MsgCount-1`) and lookup registered message.
-4. Return an error code for invalid/unregistered messages.
-5. If `size == HEADER_SIZE`, process as ACK path.
-6. Otherwise require payload size exactly equal to `IMessage::size()`.
-7. Call `handle(payload, payload_size)`.
-8. For ack-required messages, queue echo ACK (unless queue full).
+3. Reject if size > HEADER_SIZE + MaxPayloadSize (ERR_PACKET_TOO_LARGE).
+4. Validate `msg_id` (`1..MsgCount-1`) and lookup registered message.
+5. Return an error code for invalid/unregistered messages.
+6. If `size == HEADER_SIZE`, process as ACK path.
+7. Otherwise require payload size exactly equal to `IMessage::size()`.
+8. Duplicate/stale suppression (see §6.4): drop retransmits and out-of-order-older packets (handle not called), still echo ACK.
+9. Call `handle(payload, payload_size)`.
+10. For ack-required messages, queue echo ACK (unless queue full).
+
+`handle()` return convention: `0` (OK) or any non-negative value = success (ACK is echoed); a negative value = failure (no ACK, the error is propagated). The default `handle()` returns `ERR_HANDLE_MISSING`.
 
 `Node::process_packet(...)` does not emit transport diagnostics hooks directly.
 It only returns LUCP error codes.
@@ -253,21 +303,24 @@ int send_raw(uint8_t msg_id,
              uint16_t dest_port);
 ```
 
-`IMessage::send_raw(...)` forwards to the node instance set during registration.
+`TypedMessage<TPayload>::send(...)` forwards to the `INode` instance set during registration via `INode::send_raw(...)`. Calling `send()` on an unregistered message returns `ERR_NOT_REGISTERED`. `INode` is the abstract interface (declared in `message.hpp`) that decouples messages from the `Node` template.
 
 ### 9.3 Runtime APIs
 
 ```cpp
-void process_packet(const uint8_t* packet,
-                    uint16_t size,
-                    uint32_t source_ip,
-                    uint16_t source_port);
+int process_packet(const uint8_t *packet,
+                   uint16_t size,
+                   uint32_t source_ip,
+                   uint16_t source_port);
 void receive_incoming();    // Drains transport RX buffer (polling mode)
 void ack_tick();            // Drives ACK retry and exhaustion callbacks
 void flush_echo_queue();    // Dispatches queued outbound echo ACKs
 void process_all();         // Convenience: receive_incoming + ack_tick + flush_echo_queue
-void reset();
+void reset();        // Full wipe: clears the message registry, sequence counters, ACK tracking, echo queue, and dedup state.
+void reset_state();  // State-only: clears sequence counters, ACK tracking, echo queue, and dedup state; PRESERVES the message registry.
 ```
+
+`process_packet(...)` returns a LUCP error code (0 = OK, negative = error).
 
 `receive_incoming()` polls `ITransport::receive()`. For interrupt/callback-driven transports,
 call `process_packet()` directly and skip `receive_incoming()`.
@@ -285,6 +338,8 @@ Core containers are statically sized via template parameters.
 
 One notable stack allocation exists in `Node::send_raw(...)`, where a local packet buffer of `HEADER_SIZE + MaxPayloadSize` bytes is built before transport send. Select `MaxPayloadSize` with your platform stack budget in mind.
 
+Each pending-ACK slot costs `HEADER_SIZE + MaxPayloadSize` bytes; total pending-ACK RAM is `MaxPendingAcks * (HEADER_SIZE + MaxPayloadSize)`. Budget accordingly on constrained MCUs.
+
 ### 10.2 Message IDs
 
 The library reserves only ID `0` as invalid. Other ID meanings are application-defined.
@@ -292,6 +347,8 @@ The library reserves only ID `0` as invalid. Other ID meanings are application-d
 ### 10.3 Endianness
 
 The LUCP header fields are single-byte values and are byte-order agnostic. Payload endianness should be kept consistent across peers; implement shared message structs and serialization logic accordingly.
+
+On receive, the payload pointer is into a `uint8_t` buffer (alignment 1). Use `std::memcpy` to unpack payloads into typed structs; do not `reinterpret_cast` the pointer, which may be misaligned.
 
 ### 10.4 Scheduling
 
@@ -301,6 +358,14 @@ For reliable messaging and ACK echo behavior to work as intended:
 - **`ack_tick()`** should be called at a predictable cadence (e.g., every 10 ms) so retry delays are accurate.
 - **`flush_echo_queue()`** should be called regularly to dispatch pending echo ACKs with low latency.
 - **`process_all()`** calls all three in the correct order and is sufficient for simple single-threaded main loops.
+
+### 10.5 Versioning
+
+The 4-byte header has no protocol version field; the magic bytes are the only format discriminator. Future breaking wire changes would require new magic values.
+
+### 10.6 Reentrancy
+
+`handle()` and `on_fail()` run inline on the calling thread. They must NOT call `send_raw()` or any other Node-mutating API (including via another message's `send()`). The Node is single-threaded; reentering a mutating API from within a callback during `ack_tick()` or `process_packet()` iteration is undefined behavior. If a callback needs to send, defer the send to after the current `process_all()`/`ack_tick()` call returns.
 
 ---
 
