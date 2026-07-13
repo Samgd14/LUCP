@@ -230,6 +230,97 @@ void test_retry_send_failure_not_consumed()
   ASSERT_EQ(trans.sent_packets.size(), 2);
 }
 
+// A reliable message that counts handle() calls.
+class CountingReliable : public TypedMessage<uint8_t[4]>
+{
+public:
+  uint8_t id() const override { return 103; }
+  bool ack_required() const override { return true; }
+  int handle(const uint8_t *, uint16_t) override { handled_count++; return OK; }
+  int handled_count = 0;
+};
+
+void test_duplicate_retransmit_not_rehandled_but_acked()
+{
+  MockTransport trans;
+  Node<> node(trans);
+  CountingReliable msg;
+  node.register_message(&msg);
+
+  uint8_t rx[HEADER_SIZE + 4] = {MAGIC_0, MAGIC_1, 103, 5, 1, 2, 3, 4};
+  ASSERT_EQ(node.process_packet(rx, sizeof(rx), 0xC0A80501, 1000), OK);
+  ASSERT_EQ(msg.handled_count, 1);
+
+  // Same seq again (a retransmit): NOT re-handled, but ACK still echoed.
+  ASSERT_EQ(node.process_packet(rx, sizeof(rx), 0xC0A80501, 1000), OK);
+  ASSERT_EQ(msg.handled_count, 1);
+
+  node.flush_echo_queue();
+  // Two echoes queued (one per received packet, including the duplicate).
+  ASSERT_EQ(trans.sent_packets.size(), 2);
+  ASSERT_EQ(trans.sent_packets[0].data[3], 5);
+  ASSERT_EQ(trans.sent_packets[1].data[3], 5);
+}
+
+void test_out_of_order_older_dropped_newer_handled()
+{
+  MockTransport trans;
+  Node<> node(trans);
+  CountingReliable msg;
+  node.register_message(&msg);
+
+  // Receive seq 10 first (newest so far).
+  uint8_t r10[HEADER_SIZE + 4] = {MAGIC_0, MAGIC_1, 103, 10, 1, 2, 3, 4};
+  ASSERT_EQ(node.process_packet(r10, sizeof(r10), 0, 0), OK);
+  ASSERT_EQ(msg.handled_count, 1);
+
+  // Older seq 9 (out-of-order, behind 10): dropped, not handled.
+  uint8_t r9[HEADER_SIZE + 4] = {MAGIC_0, MAGIC_1, 103, 9, 1, 2, 3, 4};
+  ASSERT_EQ(node.process_packet(r9, sizeof(r9), 0, 0), OK);
+  ASSERT_EQ(msg.handled_count, 1);
+
+  // Newer seq 11: handled.
+  uint8_t r11[HEADER_SIZE + 4] = {MAGIC_0, MAGIC_1, 103, 11, 1, 2, 3, 4};
+  ASSERT_EQ(node.process_packet(r11, sizeof(r11), 0, 0), OK);
+  ASSERT_EQ(msg.handled_count, 2);
+}
+
+void test_wrap_around_new_packet_handled()
+{
+  MockTransport trans;
+  Node<> node(trans);
+  CountingReliable msg;
+  node.register_message(&msg);
+
+  // Last seen = 250.
+  uint8_t r250[HEADER_SIZE + 4] = {MAGIC_0, MAGIC_1, 103, 250, 1, 2, 3, 4};
+  node.process_packet(r250, sizeof(r250), 0, 0);
+  ASSERT_EQ(msg.handled_count, 1);
+
+  // seq 5 after 250: diff (250-5)&0xFF = 245 > 127 -> treated as newer (wrapped). Handled.
+  uint8_t r5[HEADER_SIZE + 4] = {MAGIC_0, MAGIC_1, 103, 5, 1, 2, 3, 4};
+  ASSERT_EQ(node.process_packet(r5, sizeof(r5), 0, 0), OK);
+  ASSERT_EQ(msg.handled_count, 2);
+}
+
+void test_reset_state_clears_dedup()
+{
+  MockTransport trans;
+  Node<> node(trans);
+  CountingReliable msg;
+  node.register_message(&msg);
+
+  uint8_t rx[HEADER_SIZE + 4] = {MAGIC_0, MAGIC_1, 103, 5, 1, 2, 3, 4};
+  node.process_packet(rx, sizeof(rx), 0, 0);
+  ASSERT_EQ(msg.handled_count, 1);
+
+  node.reset_state(); // preserves registry, clears dedup + seq + ack state
+
+  // Same seq 5 again after reset -> treated as new, handled.
+  ASSERT_EQ(node.process_packet(rx, sizeof(rx), 0, 0), OK);
+  ASSERT_EQ(msg.handled_count, 2);
+}
+
 int main()
 {
   test_ack_workflow();
@@ -239,6 +330,10 @@ int main()
   test_positive_handle_still_acks();
   test_spurious_ack_returns_no_pending();
   test_retry_send_failure_not_consumed();
+  test_duplicate_retransmit_not_rehandled_but_acked();
+  test_out_of_order_older_dropped_newer_handled();
+  test_wrap_around_new_packet_handled();
+  test_reset_state_clears_dedup();
   std::cout << "test_ack_echo PASSED\n";
   return 0;
 }

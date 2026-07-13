@@ -257,6 +257,8 @@ namespace lucp
       {
         m_registry[i] = nullptr;
         m_seq_id[i] = 0;
+        m_last_seq[i] = 0;
+        m_seq_seen[i] = false;
       }
       m_ack_manager.reset();
       m_echo_queue.reset();
@@ -270,6 +272,8 @@ namespace lucp
       for (size_t i = 0; i < MsgCount; ++i)
       {
         m_seq_id[i] = 0;
+        m_last_seq[i] = 0;
+        m_seq_seen[i] = false;
       }
       m_ack_manager.reset();
       m_echo_queue.reset();
@@ -466,6 +470,26 @@ namespace lucp
         return ERR_INVALID_PACKET;
       }
 
+      // Duplicate / stale-packet suppression (per msg_id, wrap-aware).
+      // A packet whose seq equals the last seen (retransmit) or is behind it
+      // within a half-window (out-of-order older) is a duplicate: handle() is
+      // NOT called, but an ACK echo is still sent so the sender stops retrying.
+      // Latest-takes-precedence; out-of-order older packets are dropped by design.
+      const bool duplicate =
+          m_seq_seen[msg_id] &&
+          (((m_last_seq[msg_id] - seq_id) & 0xFF) <= 127);
+
+      if (duplicate)
+      {
+        if (requires_ack)
+        {
+          if (m_echo_queue.is_full())
+            return ERR_QUEUE_FULL;
+          return m_echo_queue.enqueue(packet, source_ip, source_port);
+        }
+        return OK;
+      }
+
       // If ACK is required but echo queue is full, drop the packet immediately
       if (requires_ack && m_echo_queue.is_full())
       {
@@ -477,6 +501,10 @@ namespace lucp
       int rc = msg->handle(packet + HEADER_SIZE, payload_size);
       if (rc < 0)
         return rc;
+
+      // New (non-duplicate) packet: update dedup state.
+      m_last_seq[msg_id] = seq_id;
+      m_seq_seen[msg_id] = true;
 
       // Enqueue an ACK echo if required; normalize a non-negative handle rc to OK.
       if (requires_ack)
@@ -560,6 +588,8 @@ namespace lucp
 
     IMessage *m_registry[MsgCount] = {};
     uint8_t m_seq_id[MsgCount] = {};
+    uint8_t m_last_seq[MsgCount] = {};   // last handled seq per msg_id (dedup)
+    bool m_seq_seen[MsgCount] = {};     // whether msg_id has ever been handled
 
     internal::EchoQueue<EchoQueueDepth> m_echo_queue;
     internal::AckManager<MaxPendingAcks, MaxPayloadSize> m_ack_manager;
