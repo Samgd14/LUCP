@@ -262,7 +262,7 @@ void test_duplicate_retransmit_not_rehandled_but_acked()
   ASSERT_EQ(trans.sent_packets[1].data[3], 5);
 }
 
-void test_out_of_order_older_dropped_newer_handled()
+void test_default_rejects_out_of_order_older()
 {
   MockTransport trans;
   Node<> node(trans);
@@ -330,6 +330,47 @@ public:
   int handled_count = 0;
 };
 
+// A reliable message that accepts out-of-order (older) packets.
+class AcceptingReliable : public TypedMessage<uint8_t[4]>
+{
+public:
+  uint8_t id() const override { return 105; }
+  bool ack_required() const override { return true; }
+  bool reject_out_of_order() const override { return false; }
+  int handle(const uint8_t *, uint16_t) override { handled_count++; return OK; }
+  int handled_count = 0;
+};
+
+void test_accept_out_of_order_handles_older()
+{
+  MockTransport trans;
+  Node<> node(trans);
+  AcceptingReliable msg;
+  node.register_message(&msg);
+
+  // seq 50 first (newest so far) -> handled.
+  uint8_t r50[HEADER_SIZE + 4] = {MAGIC_0, MAGIC_1, 105, 50, 1, 2, 3, 4};
+  ASSERT_EQ(node.process_packet(r50, sizeof(r50), 0, 0), OK);
+  ASSERT_EQ(msg.handled_count, 1);
+
+  // Older seq 40 (out-of-order, behind 50): accepted (not dropped) -> handled, ACKed.
+  uint8_t r40[HEADER_SIZE + 4] = {MAGIC_0, MAGIC_1, 105, 40, 1, 2, 3, 4};
+  ASSERT_EQ(node.process_packet(r40, sizeof(r40), 0, 0), OK);
+  ASSERT_EQ(msg.handled_count, 2);
+
+  // Newer seq 51 still handled (last_seq did not regress to 40).
+  uint8_t r51[HEADER_SIZE + 4] = {MAGIC_0, MAGIC_1, 105, 51, 1, 2, 3, 4};
+  ASSERT_EQ(node.process_packet(r51, sizeof(r51), 0, 0), OK);
+  ASSERT_EQ(msg.handled_count, 3);
+
+  // Each received packet queued an ACK echo.
+  node.flush_echo_queue();
+  ASSERT_EQ(trans.sent_packets.size(), 3);
+  ASSERT_EQ(trans.sent_packets[0].data[3], 50);
+  ASSERT_EQ(trans.sent_packets[1].data[3], 40);
+  ASSERT_EQ(trans.sent_packets[2].data[3], 51);
+}
+
 void test_echo_queue_full_drops_before_handle()
 {
   MockTransport trans;
@@ -387,7 +428,8 @@ int main()
   test_spurious_ack_returns_no_pending();
   test_retry_send_failure_not_consumed();
   test_duplicate_retransmit_not_rehandled_but_acked();
-  test_out_of_order_older_dropped_newer_handled();
+  test_default_rejects_out_of_order_older();
+  test_accept_out_of_order_handles_older();
   test_wrap_around_new_packet_handled();
   test_reset_state_clears_dedup();
   test_echo_queue_full_drops_before_handle();

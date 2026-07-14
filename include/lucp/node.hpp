@@ -471,16 +471,19 @@ namespace lucp
       }
 
       // Duplicate / stale-packet suppression (per msg_id, wrap-aware).
-      // A packet whose seq equals the last seen (retransmit) or is behind it
-      // within a half-window (out-of-order older) is a duplicate: handle() is
-      // NOT called, but an ACK echo is still sent so the sender stops retrying.
-      // Latest-takes-precedence; out-of-order older packets are dropped by design.
-      const bool duplicate =
-          m_seq_seen[msg_id] &&
-          (((m_last_seq[msg_id] - seq_id) & 0xFF) <= 127);
+      //   diff == 0      : exact retransmit of the latest handled seq -> always drop+ACK.
+      //   diff 1..127    : older (behind latest) within half-window:
+      //                      reject_out_of_order() true  -> drop + ACK (latest-takes-precedence)
+      //                      false (accept)             -> handle + ACK, do NOT advance last_seq
+      //   diff 128..255  : newer (ahead / wrapped)     -> handle + ACK, advance last_seq
+      const uint8_t diff =
+          m_seq_seen[msg_id] ? ((m_last_seq[msg_id] - seq_id) & 0xFF) : 0xFF;
+      const bool is_exact_retransmit = m_seq_seen[msg_id] && (diff == 0);
+      const bool is_older = m_seq_seen[msg_id] && (diff >= 1 && diff <= 127);
 
-      if (duplicate)
+      if (is_exact_retransmit || (is_older && msg->reject_out_of_order()))
       {
+        // Drop: do not call handle(). Still echo an ACK so the sender stops retrying.
         if (requires_ack)
         {
           if (m_echo_queue.is_full())
@@ -502,9 +505,13 @@ namespace lucp
       if (rc < 0)
         return rc;
 
-      // New (non-duplicate) packet: update dedup state.
-      m_last_seq[msg_id] = seq_id;
-      m_seq_seen[msg_id] = true;
+      // New or accepted out-of-order packet: advance dedup state only when
+      // genuinely newer, so last_seq never regresses to an older handled seq.
+      if (!m_seq_seen[msg_id] || (diff >= 128))
+      {
+        m_last_seq[msg_id] = seq_id;
+        m_seq_seen[msg_id] = true;
+      }
 
       // Enqueue an ACK echo if required; normalize a non-negative handle rc to OK.
       if (requires_ack)

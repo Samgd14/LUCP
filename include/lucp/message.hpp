@@ -49,6 +49,18 @@ namespace lucp
     virtual uint8_t max_retries() const { return 0; }
     virtual uint16_t retry_delay_ms() const { return 0; }
 
+    /**
+     * @brief Whether the receiver should reject out-of-order (older-than-latest)
+     *        packets for this message type.
+     * @return true (default) = latest-takes-precedence: drop older packets, only
+     *         handle the newest seq. false = accept out-of-order packets (e.g. for
+     *         timestamped data where order is irrelevant). When false, the node
+     *         still suppresses the exact retransmit of the most-recent seq, but
+     *         retransmits of older seqs MAY be handled twice — applications should
+     *         dedup by timestamp.
+     */
+    virtual bool reject_out_of_order() const { return true; }
+
     // -------------------------------------------------------------
     // Receiver Handlers
     // -------------------------------------------------------------
