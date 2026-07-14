@@ -371,6 +371,55 @@ void test_accept_out_of_order_handles_older()
   ASSERT_EQ(trans.sent_packets[2].data[3], 51);
 }
 
+// When out-of-order is accepted, a retransmit of an OLDER seq is handled again
+// (double delivery). This is the documented trade-off: applications receiving
+// timestamped data should dedup by timestamp. Pinned as intentional.
+void test_accept_out_of_order_older_retransmit_double_delivers()
+{
+  MockTransport trans;
+  Node<> node(trans);
+  AcceptingReliable msg;
+  node.register_message(&msg);
+
+  uint8_t r50[HEADER_SIZE + 4] = {MAGIC_0, MAGIC_1, 105, 50, 1, 2, 3, 4};
+  ASSERT_EQ(node.process_packet(r50, sizeof(r50), 0, 0), OK); // handled (1)
+
+  uint8_t r40[HEADER_SIZE + 4] = {MAGIC_0, MAGIC_1, 105, 40, 1, 2, 3, 4};
+  ASSERT_EQ(node.process_packet(r40, sizeof(r40), 0, 0), OK); // handled (2), older accepted
+
+  // Retransmit of the older seq 40: handled AGAIN (double delivery).
+  ASSERT_EQ(node.process_packet(r40, sizeof(r40), 0, 0), OK);
+  ASSERT_EQ(msg.handled_count, 3);
+
+  // All three packets were ACKed.
+  node.flush_echo_queue();
+  ASSERT_EQ(trans.sent_packets.size(), 3);
+}
+
+// Even when out-of-order is accepted, the exact retransmit of the LATEST seq
+// is still suppressed (not double-handled) and still ACKed.
+void test_accept_out_of_order_exact_retransmit_still_suppressed()
+{
+  MockTransport trans;
+  Node<> node(trans);
+  AcceptingReliable msg;
+  node.register_message(&msg);
+
+  uint8_t r50[HEADER_SIZE + 4] = {MAGIC_0, MAGIC_1, 105, 50, 1, 2, 3, 4};
+  ASSERT_EQ(node.process_packet(r50, sizeof(r50), 0, 0), OK);
+  ASSERT_EQ(msg.handled_count, 1);
+
+  // Exact retransmit of seq 50 (diff == 0): NOT re-handled.
+  ASSERT_EQ(node.process_packet(r50, sizeof(r50), 0, 0), OK);
+  ASSERT_EQ(msg.handled_count, 1);
+
+  // But an ACK echo is still queued for the retransmit.
+  node.flush_echo_queue();
+  ASSERT_EQ(trans.sent_packets.size(), 2);
+  ASSERT_EQ(trans.sent_packets[0].data[3], 50);
+  ASSERT_EQ(trans.sent_packets[1].data[3], 50);
+}
+
 void test_echo_queue_full_drops_before_handle()
 {
   MockTransport trans;
@@ -430,6 +479,8 @@ int main()
   test_duplicate_retransmit_not_rehandled_but_acked();
   test_default_rejects_out_of_order_older();
   test_accept_out_of_order_handles_older();
+  test_accept_out_of_order_older_retransmit_double_delivers();
+  test_accept_out_of_order_exact_retransmit_still_suppressed();
   test_wrap_around_new_packet_handled();
   test_reset_state_clears_dedup();
   test_echo_queue_full_drops_before_handle();
