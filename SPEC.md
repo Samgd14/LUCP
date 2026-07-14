@@ -134,6 +134,14 @@ virtual uint8_t  max_retries() const { return 0; }
 virtual uint16_t retry_delay_ms() const { return 0; }
 ```
 
+Optional receive-side ordering parameter:
+
+```cpp
+virtual bool reject_out_of_order() const { return true; }
+```
+
+When `true` (the default), the receiver drops out-of-order (older-than-latest) packets for this `msg_id` — latest-takes-precedence. When `false`, the receiver accepts out-of-order packets (e.g. timestamped data where arrival order is irrelevant). See §6.4.1 for the dedup contract when out-of-order is accepted.
+
 Receive and failure hooks (should be implemented per-platform):
 
 ```cpp
@@ -211,14 +219,25 @@ If the echo queue is full, the packet is dropped before `handle()` is called.
 
 ### 6.4.1 Duplicate / Stale-Packet Suppression
 
-The receiver tracks, per msg_id, the last handled sequence byte. On an inbound data packet:
+The receiver tracks, per msg_id, the last handled sequence byte. For an inbound data packet it computes the wrap-aware distance from the last handled seq:
 
-- If the msg_id has been seen before and the incoming seq equals the last seen (a retransmit) or is behind it within a half-window (an out-of-order older packet), the packet is a **duplicate**: `handle()` is NOT called, but the ACK echo is still sent so the sender stops retrying.
-- Otherwise the packet is new: `handle()` is called and the last-seen seq is updated.
+```
+diff = ((last_seen - seq) & 0xFF)        // 0xFF sentinel when msg_id unseen
+```
 
-Latest-takes-precedence: out-of-order older packets are dropped by design. This is the expected behavior for low-latency data streaming. Applications that cannot tolerate dropped older packets must avoid relying on out-of-order delivery.
+- `diff == 0` — exact retransmit of the latest handled seq: `handle()` is NOT called; the ACK echo is still sent so the sender stops retrying. (Unconditional — exact retransmits are always suppressed.)
+- `diff` in `1..127` — older (behind the latest) within the half-window:
+  - If `IMessage::reject_out_of_order()` returns `true` (the default): `handle()` is NOT called; the ACK echo is still sent (latest-takes-precedence).
+  - If it returns `false`: `handle()` IS called and the ACK echo is sent; the last-seen seq is NOT advanced (out-of-order accepted).
+- `diff` in `128..255` — newer (ahead / wrapped): `handle()` is called, the ACK echo is sent, and the last-seen seq is advanced.
 
-The half-window comparison is `((last_seen - seq) & 0xFF) <= 127` (behind/equal) vs `> 127` (ahead / wrapped-newer). Dedup state is keyed per msg_id and is reset by both `reset()` and `reset_state()`.
+Latest-takes-precedence is the default. It is the expected behavior for low-latency data streaming, where only the newest value matters. Set `reject_out_of_order()` to `false` for message types carrying timestamped data where every distinct packet is meaningful regardless of arrival order.
+
+**Caveat when out-of-order is accepted:** the node suppresses only the exact retransmit of the most-recent seq. Retransmits of older (out-of-order) seqs MAY be handled more than once, because the single per-`msg_id` counter cannot distinguish an already-handled older seq from a fresh one. Applications receiving timestamped data should dedup by timestamp. (A per-`msg_id` handled-seq bitmap that would close this gap was rejected on RAM grounds — ~32 bytes per `msg_id`.)
+
+The flag does not affect ACK behavior: dropped and handled out-of-order packets are both acknowledged so the sender stops retrying either way.
+
+Dedup state is keyed per msg_id and is reset by both `reset()` and `reset_state()`.
 
 ---
 
@@ -233,7 +252,7 @@ The half-window comparison is `((last_seen - seq) & 0xFF) <= 127` (behind/equal)
 5. Return an error code for invalid/unregistered messages.
 6. If `size == HEADER_SIZE`, process as ACK path.
 7. Otherwise require payload size exactly equal to `IMessage::size()`.
-8. Duplicate/stale suppression (see §6.4): drop retransmits and out-of-order-older packets (handle not called), still echo ACK.
+8. Duplicate/stale suppression (see §6.4.1): drop exact retransmits unconditionally; drop out-of-order-older packets only if `reject_out_of_order()` (default true); still echo ACK either way.
 9. Call `handle(payload, payload_size)`.
 10. For ack-required messages, queue echo ACK (unless queue full).
 
