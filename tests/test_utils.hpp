@@ -2,6 +2,7 @@
 
 #include <iostream>
 #include <cstdlib>
+#include <cstring>
 
 #define ASSERT_TRUE(condition)                                                                                 \
   do                                                                                                           \
