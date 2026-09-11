@@ -291,7 +291,7 @@ The protocol core does not enforce byte order conversion of IP values; applicati
 template <size_t MsgCount      = 256,
           size_t EchoQueueDepth = 16,
           size_t MaxPendingAcks = 4,
-          size_t MaxPayloadSize = 256,
+          size_t MaxPayloadSize = 64,
           size_t MaxRecvBurst   = 64>
 class Node;
 ```
